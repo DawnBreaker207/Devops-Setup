@@ -81,7 +81,7 @@ configure_pipeline_deps() {
     sudo chmod 700 "$vol_path/.ssh" && sudo chmod 600 "$vol_path/.ssh/id_ed25519"
 
     info "Installing Docker CLI inside Jenkins container..."
-    docker exec -u root jenkins bash -c "apt-get update -qq && apt-get install -y -qq docker-ce-cli docker-compose-v2"
+    docker exec -u root jenkins bash -c "apt-get update -qq && apt-get install -y -qq docker-ce-cli docker-compose-plugin"
 }
 
 
