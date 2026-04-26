@@ -5,7 +5,7 @@
 Run this on a clean Ubuntu 24.04 LTS server:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/tunganhngo207/<REPO_NAME>/main/setup.sh | bash
+curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/main/setup.sh | bash
 ```
 
 ## 2. Jenkins Initialization
