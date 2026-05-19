@@ -6,14 +6,7 @@ NET="infra_network"
 JENKINS_HOME="jenkins_data"
 CF_CONFIG_DIR="$HOME/.cloudflared"
 
-# --- Flags ---
-FORCE=false
-for arg in "$@"; do
-    [[ "$arg" == "--force" ]] && FORCE=true
-done
-
-# Pipe-safety: curl | bash chiếm stdin, dùng /dev/tty trực tiếp
-# bằng cách mở fd 0 lại trước khi chạy bất cứ thứ gì
+# Pipe-safety: curl | bash chiếm stdin, reopen từ /dev/tty
 if [ ! -t 0 ]; then
     exec < /dev/tty
 fi
@@ -52,7 +45,6 @@ prompt_config() {
     echo "=============================================="
     echo "         Infrastructure Setup Config"
     echo "=============================================="
-    [[ "$FORCE" == true ]] && warn "Running in --force mode: existing resources will be overwritten."
 
     ask "GitHub Email"
     read -r GITHUB_EMAIL < /dev/tty
@@ -65,10 +57,9 @@ prompt_config() {
     read -r USER_DOMAIN < /dev/tty
 
     echo "----------------------------------------------"
-    echo "  GitHub Email   : $GITHUB_EMAIL"
-    echo "  Tunnel Name    : $CF_TUNNEL_NAME"
-    echo "  Domain         : ${USER_DOMAIN:-"(skipped)"}"
-    echo "  Force/overwrite: $FORCE"
+    echo "  GitHub Email : $GITHUB_EMAIL"
+    echo "  Tunnel Name  : $CF_TUNNEL_NAME"
+    echo "  Domain       : ${USER_DOMAIN:-"(skipped)"}"
     echo "----------------------------------------------"
     ask "Confirm? (y/n)"
     read -r CONFIRM < /dev/tty
@@ -112,11 +103,6 @@ prep_system() {
     if ! docker network inspect "$NET" >/dev/null 2>&1; then
         docker network create "$NET"
         push_rollback "docker network rm '$NET' 2>/dev/null || true"
-    elif [[ "$FORCE" == true ]]; then
-        warn "Network '$NET' exists — recreating (--force)..."
-        docker network rm "$NET" 2>/dev/null || true
-        docker network create "$NET"
-        push_rollback "docker network rm '$NET' 2>/dev/null || true"
     else
         ok "Network '$NET' already exists."
     fi
@@ -147,13 +133,8 @@ launch_container() {
     local args=$2
 
     if [ "$(docker ps -aq -f name=^/${name}$)" ]; then
-        if [[ "$FORCE" == true ]]; then
-            warn "Container '$name' exists — removing and recreating (--force)..."
-            docker rm -f "$name"
-        else
-            warn "Container '$name' already exists. Skipping."
-            return
-        fi
+        warn "Container '$name' already exists. Skipping."
+        return
     fi
 
     docker run -d --name "$name" --restart always --network "$NET" $args
@@ -185,11 +166,6 @@ configure_pipeline_deps() {
     if [ ! -f ~/.ssh/id_ed25519 ]; then
         ssh-keygen -t ed25519 -C "$GITHUB_EMAIL" -N "" -f ~/.ssh/id_ed25519
         push_rollback "rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub"
-    elif [[ "$FORCE" == true ]]; then
-        warn "SSH key exists — regenerating (--force)..."
-        rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
-        ssh-keygen -t ed25519 -C "$GITHUB_EMAIL" -N "" -f ~/.ssh/id_ed25519
-        push_rollback "rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub"
     else
         ok "SSH key already exists."
     fi
@@ -204,7 +180,7 @@ configure_pipeline_deps() {
     done
     echo ""
 
-    if ! sudo test -f "$vol_path/.ssh/id_ed25519" || [[ "$FORCE" == true ]]; then
+    if ! sudo test -f "$vol_path/.ssh/id_ed25519"; then
         info "Injecting SSH keys into Jenkins volume..."
         sudo mkdir -p "$vol_path/.ssh"
         sudo cp ~/.ssh/id_ed25519* "$vol_path/.ssh/"
@@ -229,13 +205,7 @@ configure_pipeline_deps() {
 # ---------------------------------------------------------------------------
 configure_cloudflare_tunnel() {
     info "Configuring Cloudflare Tunnel..."
-
-    if [ ! -d "$CF_CONFIG_DIR" ]; then
-        mkdir -p "$CF_CONFIG_DIR"
-        push_rollback "rm -rf '$CF_CONFIG_DIR'"
-    else
-        mkdir -p "$CF_CONFIG_DIR"
-    fi
+    mkdir -p "$CF_CONFIG_DIR"
 
     if [ ! -f "$CF_CONFIG_DIR/cert.pem" ]; then
         info "Logging in to Cloudflare (browser will open)..."
@@ -249,11 +219,6 @@ configure_cloudflare_tunnel() {
         info "Creating tunnel: $CF_TUNNEL_NAME"
         cloudflared tunnel create "$CF_TUNNEL_NAME"
         push_rollback "cloudflared tunnel delete '$CF_TUNNEL_NAME' 2>/dev/null || true"
-    elif [[ "$FORCE" == true ]]; then
-        warn "Tunnel '$CF_TUNNEL_NAME' exists — deleting and recreating (--force)..."
-        cloudflared tunnel delete "$CF_TUNNEL_NAME" --force 2>/dev/null || true
-        cloudflared tunnel create "$CF_TUNNEL_NAME"
-        push_rollback "cloudflared tunnel delete '$CF_TUNNEL_NAME' 2>/dev/null || true"
     else
         ok "Tunnel '$CF_TUNNEL_NAME' already exists."
     fi
@@ -262,16 +227,7 @@ configure_cloudflare_tunnel() {
     TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | awk "/$CF_TUNNEL_NAME/ {print \$1}")
 
     local CONFIG_FILE="$CF_CONFIG_DIR/config.yml"
-
-    # Backup config cũ nếu --force và file đã tồn tại
-    if [ -f "$CONFIG_FILE" ] && [[ "$FORCE" == true ]]; then
-        local config_backup="${CONFIG_FILE}.bak.$(date +%s)"
-        cp "$CONFIG_FILE" "$config_backup"
-        warn "Existing tunnel config backed up to $config_backup"
-        push_rollback "mv '$config_backup' '$CONFIG_FILE'"
-    fi
-
-    if [ ! -f "$CONFIG_FILE" ] || [[ "$FORCE" == true ]]; then
+    if [ ! -f "$CONFIG_FILE" ]; then
         info "Writing tunnel config to $CONFIG_FILE"
 
         if [ -n "${USER_DOMAIN:-}" ]; then
@@ -303,8 +259,7 @@ ingress:
 EOF
             warn "No domain provided. Ingress left empty — edit $CONFIG_FILE manually when ready."
         fi
-
-        [ ! -f "${CONFIG_FILE}.bak."* 2>/dev/null ] && push_rollback "rm -f '$CONFIG_FILE'"
+        push_rollback "rm -f '$CONFIG_FILE'"
     else
         ok "Tunnel config already exists."
     fi
@@ -312,8 +267,6 @@ EOF
     sudo mkdir -p /etc/cloudflared
     sudo cp "$CF_CONFIG_DIR/config.yml" /etc/cloudflared/config.yml
 
-    # Check trực tiếp file .service — cách đáng tin cậy nhất,
-    # không phụ thuộc vào trạng thái active/inactive của systemd
     if sudo test -f /etc/systemd/system/cloudflared.service; then
         ok "cloudflared service already installed — reloading config..."
         sudo systemctl restart cloudflared
@@ -336,7 +289,6 @@ main() {
     configure_pipeline_deps
     configure_cloudflare_tunnel
 
-    # Tất cả thành công — tắt rollback trap
     trap - ERR
 
     ok "Infrastructure is up!"
