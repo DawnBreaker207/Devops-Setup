@@ -17,14 +17,14 @@ prompt_config() {
     echo "=============================================="
 
     ask "GitHub Email"
-    read -r GITHUB_EMAIL
+    read -r GITHUB_EMAIL < /dev/tty
 
     ask "Cloudflare Tunnel Name (default: infra-tunnel)"
-    read -r CF_TUNNEL_NAME
+    read -r CF_TUNNEL_NAME < /dev/tty
     CF_TUNNEL_NAME="${CF_TUNNEL_NAME:-infra-tunnel}"
 
     ask "Your Domain (e.g. example.com) — leave blank to skip tunnel ingress"
-    read -r USER_DOMAIN
+    read -r USER_DOMAIN < /dev/tty
 
     echo "----------------------------------------------"
     echo "  GitHub Email   : $GITHUB_EMAIL"
@@ -32,7 +32,7 @@ prompt_config() {
     echo "  Domain         : ${USER_DOMAIN:-"(skipped)"}"
     echo "----------------------------------------------"
     ask "Confirm? (y/n)"
-    read -r CONFIRM
+    read -r CONFIRM < /dev/tty
     if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
         echo "Aborted."
         exit 1
