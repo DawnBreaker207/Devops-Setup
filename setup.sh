@@ -303,18 +303,12 @@ EOF
         ok "Tunnel config already exists."
     fi
 
-    # Kiểm tra service đã installed chưa (kể cả khi không active)
-    local cf_service_installed=false
-    if [ -f /etc/systemd/system/cloudflared.service ] || \
-       sudo systemctl list-unit-files cloudflared.service 2>/dev/null | grep -q cloudflared; then
-        cf_service_installed=true
-    fi
-
     sudo mkdir -p /etc/cloudflared
     sudo cp "$CF_CONFIG_DIR/config.yml" /etc/cloudflared/config.yml
 
-    if [[ "$cf_service_installed" == true ]]; then
-        # Service đã tồn tại — chỉ restart với config mới, không install lại
+    # Check trực tiếp file .service — cách đáng tin cậy nhất,
+    # không phụ thuộc vào trạng thái active/inactive của systemd
+    if sudo test -f /etc/systemd/system/cloudflared.service; then
         ok "cloudflared service already installed — reloading config..."
         sudo systemctl restart cloudflared
     else
