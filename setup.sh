@@ -157,9 +157,14 @@ configure_cloudflare_tunnel() {
     info "Configuring Cloudflare Tunnel..."
     mkdir -p "$CF_CONFIG_DIR"
 
-    if ! cloudflared tunnel list 2>/dev/null | grep -q "$CF_TUNNEL_NAME"; then
+    if [ ! -f "$CF_CONFIG_DIR/cert.pem" ]; then
         info "Logging in to Cloudflare (browser will open)..."
         cloudflared tunnel login
+    else
+        ok "Cloudflare cert already exists. Skipping login."
+    fi
+
+    if ! cloudflared tunnel list 2>/dev/null | grep -q "$CF_TUNNEL_NAME"; then
         info "Creating tunnel: $CF_TUNNEL_NAME"
         cloudflared tunnel create "$CF_TUNNEL_NAME"
     else
@@ -208,7 +213,9 @@ EOF
 
     if ! sudo systemctl is-active --quiet cloudflared 2>/dev/null; then
         info "Installing cloudflared as a system service..."
-        sudo cloudflared --config "$CF_CONFIG_DIR/config.yml" service install
+        sudo mkdir -p /etc/cloudflared
+        sudo cp "$CF_CONFIG_DIR/config.yml" /etc/cloudflared/config.yml
+        sudo cloudflared service install
         sudo systemctl enable cloudflared
         sudo systemctl start cloudflared
     else
