@@ -217,6 +217,8 @@ configure_cloudflare_tunnel() {
     else
         ok "Tunnel '$CF_TUNNEL_NAME' already exists."
     fi
+
+    # --- FIX: exact-match tunnel ID, validate credentials file ---
     local TUNNEL_ID
     TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | awk -v name="$CF_TUNNEL_NAME" '$2==name {print $1}')
     if [ -z "$TUNNEL_ID" ]; then
@@ -231,6 +233,7 @@ configure_cloudflare_tunnel() {
         exit 1
     fi
 
+    # --- FIX: kiểm tra config hiện tại có đúng tunnel ID không ---
     local CONFIG_FILE="$CF_CONFIG_DIR/config.yml"
     local EXISTING_ID=""
     if [ -f "$CONFIG_FILE" ]; then
@@ -239,7 +242,7 @@ configure_cloudflare_tunnel() {
 
     if [ ! -f "$CONFIG_FILE" ] || [ "$EXISTING_ID" != "$TUNNEL_ID" ]; then
         if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "$TUNNEL_ID" ]; then
-            warn "Config cũ dùng tunnel ID '$EXISTING_ID', ghi lại với ID mới '$TUNNEL_ID'..."
+            warn "Config has stale tunnel ID '$EXISTING_ID', overwriting with current ID '$TUNNEL_ID'..."
         fi
         info "Writing tunnel config to $CONFIG_FILE"
 
