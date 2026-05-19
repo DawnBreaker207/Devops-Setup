@@ -8,11 +8,11 @@ Run this on a clean Ubuntu 24.04 LTS server:
 curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/main/setup.sh | bash
 ```
 
-Script sẽ hỏi:
+The script will prompt for:
 
-- **GitHub Email** — dùng để tạo SSH key
-- **Cloudflare Tunnel Name** — tự đặt tên, mặc định `infra-tunnel`
-- **Domain** — nếu có, ingress tự generate. Không có thì bỏ trống
+- **GitHub Email** — used to generate SSH key
+- **Cloudflare Tunnel Name** — choose any name, default is `infra-tunnel`
+- **Domain** — if provided, ingress will be auto-generated. Leave blank to skip
 
 ## 2. Services
 
@@ -23,7 +23,7 @@ Script sẽ hỏi:
 | Nginx Proxy Manager | http://localhost:81    |
 | Uptime Kuma         | http://localhost:3001  |
 
-Nếu có domain, các service sẽ accessible qua Cloudflare Tunnel tại:
+If a domain is provided, all services will be accessible via Cloudflare Tunnel at:
 
 - `jenkins.<YOUR_DOMAIN>`
 - `portainer.<YOUR_DOMAIN>`
@@ -38,19 +38,19 @@ Unlock password:
 sudo docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
 ```
 
-Required Credentials — vào **Manage Jenkins → Credentials → Add**:
+Required Credentials — go to **Manage Jenkins → Credentials → Add**:
 
-| ID                | Type            | Value                             |
-| ----------------- | --------------- | --------------------------------- |
-| `Github-key`      | SSH Private Key | nội dung file `~/.ssh/id_ed25519` |
-| `pro.env`         | Secret File     | upload file `.env` production     |
-| `discord-webhook` | Secret text     | Discord Webhook URL               |
+| ID                | Type            | Value                              |
+| ----------------- | --------------- | ---------------------------------- |
+| `Github-key`      | SSH Private Key | content of `~/.ssh/id_ed25519`     |
+| `pro.env`         | Secret File     | upload your production `.env` file |
+| `discord-webhook` | Secret text     | Discord Webhook URL                |
 
 ## 4. CI/CD Pipeline
 
-### Bước 1 — Tạo `deploy.config` trong repo của project
+### Step 1 — Create `deploy.config` in your project repo
 
-Đặt file này ở root của từng repo cần deploy:
+Place this file at the root of each repo you want to deploy:
 
 ```ini
 # deploy.config
@@ -62,18 +62,18 @@ APP_PORT    = 8888
 APP_NAME    = Example
 ```
 
-| Key           | Mô tả                                       |
-| ------------- | ------------------------------------------- |
-| `REPO_URL`    | SSH URL của repo — bắt buộc phải có `git@`  |
-| `BRANCH`      | Branch deploy, mặc định `main`              |
-| `COMPOSE_DIR` | Thư mục chứa `docker-compose.yml`           |
-| `ENV_FILE_ID` | Credential ID của file `.env` trong Jenkins |
-| `APP_PORT`    | Port app expose ra để health check          |
-| `APP_NAME`    | Tên hiển thị trong Discord notification     |
+| Key           | Description                                        |
+| ------------- | -------------------------------------------------- |
+| `REPO_URL`    | SSH URL of the repo — must start with `git@`       |
+| `BRANCH`      | Branch to deploy, default is `main`                |
+| `COMPOSE_DIR` | Directory containing `docker-compose.yml`          |
+| `ENV_FILE_ID` | Credential ID of the `.env` file stored in Jenkins |
+| `APP_PORT`    | Port the app exposes for health check              |
+| `APP_NAME`    | Name displayed in Discord notifications            |
 
-### Bước 2 — Tạo Jenkins Pipeline job
+### Step 2 — Create a Jenkins Pipeline job
 
-New Item → Pipeline → paste script sau vào ô **Pipeline script**:
+New Item → Pipeline → paste the following script into the **Pipeline script** field:
 
 ```groovy
 pipeline {
@@ -234,6 +234,6 @@ pipeline {
 }
 ```
 
-### Bước 3 — Override khi trigger tay (tuỳ chọn)
+### Step 3 — Override when triggering manually (optional)
 
-Khi build với **Build with Parameters**, các ô để trống sẽ tự đọc từ `deploy.config`. Chỉ điền vào khi muốn override — ví dụ deploy thử branch khác mà không cần sửa file.
+When building with **Build with Parameters**, any field left empty will fall back to values from `deploy.config`. Only fill in fields you want to override — for example, deploying a different branch without editing the config file.
