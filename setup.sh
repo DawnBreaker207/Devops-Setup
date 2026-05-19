@@ -8,11 +8,15 @@ CF_CONFIG_DIR="$HOME/.cloudflared"
 
 # --- Flags ---
 FORCE=false
-_REEXEC=false
 for arg in "$@"; do
-    [[ "$arg" == "--force" ]]   && FORCE=true
-    [[ "$arg" == "--reexec" ]]  && _REEXEC=true
+    [[ "$arg" == "--force" ]] && FORCE=true
 done
+
+# Pipe-safety: curl | bash chiếm stdin, dùng /dev/tty trực tiếp
+# bằng cách mở fd 0 lại trước khi chạy bất cứ thứ gì
+if [ ! -t 0 ]; then
+    exec < /dev/tty
+fi
 
 info() { printf "%b[INFO]%b %s\n" "\e[34m" "\e[0m" "$1"; }
 ok()   { printf "%b[OK]%b   %s\n" "\e[32m" "\e[0m" "$1"; }
@@ -326,17 +330,6 @@ EOF
 # --- Execution ---
 # ---------------------------------------------------------------------------
 main() {
-    # Pipe-safety: nếu chạy qua "curl ... | bash", stdin bị curl chiếm.
-    # Dùng flag --reexec để tránh vòng lặp vô hạn.
-    if [[ "$_REEXEC" == false && ! -t 0 ]]; then
-        warn "Detected piped stdin — downloading and re-executing from disk..."
-        local _tmp
-        _tmp=$(mktemp /tmp/setup-infra.XXXXXX.sh)
-        curl -fsSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/main/setup.sh -o "$_tmp"
-        chmod +x "$_tmp"
-        exec bash "$_tmp" --reexec "$@" < /dev/tty
-    fi
-
     prompt_config
     prep_system
     deploy_stack
