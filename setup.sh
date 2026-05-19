@@ -278,11 +278,6 @@ EOF
 # --- Execution ---
 # ---------------------------------------------------------------------------
 main() {
-    # Pipe-safety: curl | bash chiếm stdin, reopen từ /dev/tty
-    if [ ! -t 0 ]; then
-        exec < /dev/tty
-    fi
-
     prompt_config
     prep_system
     deploy_stack
@@ -306,4 +301,4 @@ main() {
     echo "======================================================"
 }
 
-main "$@"
+{ main "$@"; } < /dev/tty
