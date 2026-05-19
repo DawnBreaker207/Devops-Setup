@@ -210,25 +210,43 @@ configure_cloudflare_tunnel() {
         ok "Cloudflare cert already exists. Skipping login."
     fi
 
-    if ! cloudflared tunnel list 2>/dev/null | grep -q "$CF_TUNNEL_NAME"; then
+    if ! cloudflared tunnel list 2>/dev/null | awk '{print $2}' | grep -qx "$CF_TUNNEL_NAME"; then
         info "Creating tunnel: $CF_TUNNEL_NAME"
         cloudflared tunnel create "$CF_TUNNEL_NAME"
         push_rollback "cloudflared tunnel delete '$CF_TUNNEL_NAME' 2>/dev/null || true"
     else
         ok "Tunnel '$CF_TUNNEL_NAME' already exists."
     fi
-
     local TUNNEL_ID
-    TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | awk "/$CF_TUNNEL_NAME/ {print \$1}")
+    TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | awk -v name="$CF_TUNNEL_NAME" '$2==name {print $1}')
+    if [ -z "$TUNNEL_ID" ]; then
+        err "Cannot resolve tunnel ID for '$CF_TUNNEL_NAME'. Aborting."
+        exit 1
+    fi
+
+    local CREDS_FILE="$CF_CONFIG_DIR/${TUNNEL_ID}.json"
+    if [ ! -f "$CREDS_FILE" ]; then
+        err "Credentials file not found: $CREDS_FILE"
+        err "Tunnel may have been created under a different account or deleted."
+        exit 1
+    fi
 
     local CONFIG_FILE="$CF_CONFIG_DIR/config.yml"
-    if [ ! -f "$CONFIG_FILE" ]; then
+    local EXISTING_ID=""
+    if [ -f "$CONFIG_FILE" ]; then
+        EXISTING_ID=$(grep '^tunnel:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' || true)
+    fi
+
+    if [ ! -f "$CONFIG_FILE" ] || [ "$EXISTING_ID" != "$TUNNEL_ID" ]; then
+        if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "$TUNNEL_ID" ]; then
+            warn "Config cũ dùng tunnel ID '$EXISTING_ID', ghi lại với ID mới '$TUNNEL_ID'..."
+        fi
         info "Writing tunnel config to $CONFIG_FILE"
 
         if [ -n "${USER_DOMAIN:-}" ]; then
             cat > "$CONFIG_FILE" <<EOF
 tunnel: ${TUNNEL_ID}
-credentials-file: ${CF_CONFIG_DIR}/${TUNNEL_ID}.json
+credentials-file: ${CREDS_FILE}
 
 ingress:
   - hostname: jenkins.${USER_DOMAIN}
@@ -247,7 +265,7 @@ EOF
         else
             cat > "$CONFIG_FILE" <<EOF
 tunnel: ${TUNNEL_ID}
-credentials-file: ${CF_CONFIG_DIR}/${TUNNEL_ID}.json
+credentials-file: ${CREDS_FILE}
 
 ingress:
   - service: http_status:404
@@ -256,7 +274,7 @@ EOF
         fi
         push_rollback "rm -f '$CONFIG_FILE'"
     else
-        ok "Tunnel config already exists."
+        ok "Tunnel config already exists and tunnel ID matches. Skipping."
     fi
 
     sudo mkdir -p /etc/cloudflared
