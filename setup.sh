@@ -6,10 +6,12 @@ NET="infra_network"
 JENKINS_HOME="jenkins_data"
 CF_CONFIG_DIR="$HOME/.cloudflared"
 
-# --- Force/overwrite mode (pass --force to recreate everything) ---
+# --- Flags ---
 FORCE=false
+_REEXEC=false
 for arg in "$@"; do
-    [[ "$arg" == "--force" ]] && FORCE=true
+    [[ "$arg" == "--force" ]]   && FORCE=true
+    [[ "$arg" == "--reexec" ]]  && _REEXEC=true
 done
 
 info() { printf "%b[INFO]%b %s\n" "\e[34m" "\e[0m" "$1"; }
@@ -325,14 +327,14 @@ EOF
 # ---------------------------------------------------------------------------
 main() {
     # Pipe-safety: nếu chạy qua "curl ... | bash", stdin bị curl chiếm.
-    # Tải script về file tạm rồi chạy lại từ disk với stdin gắn vào /dev/tty.
-    if [ ! -t 0 ]; then
+    # Dùng flag --reexec để tránh vòng lặp vô hạn.
+    if [[ "$_REEXEC" == false && ! -t 0 ]]; then
         warn "Detected piped stdin — downloading and re-executing from disk..."
         local _tmp
         _tmp=$(mktemp /tmp/setup-infra.XXXXXX.sh)
         curl -fsSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/main/setup.sh -o "$_tmp"
         chmod +x "$_tmp"
-        exec bash "$_tmp" "$@" < /dev/tty
+        exec bash "$_tmp" --reexec "$@" < /dev/tty
     fi
 
     prompt_config
