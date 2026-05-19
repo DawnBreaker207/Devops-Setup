@@ -6,11 +6,6 @@ NET="infra_network"
 JENKINS_HOME="jenkins_data"
 CF_CONFIG_DIR="$HOME/.cloudflared"
 
-# Pipe-safety: curl | bash chiếm stdin, reopen từ /dev/tty
-if [ ! -t 0 ]; then
-    exec < /dev/tty
-fi
-
 info() { printf "%b[INFO]%b %s\n" "\e[34m" "\e[0m" "$1"; }
 ok()   { printf "%b[OK]%b   %s\n" "\e[32m" "\e[0m" "$1"; }
 warn() { printf "%b[WARN]%b %s\n" "\e[33m" "\e[0m" "$1"; }
@@ -283,6 +278,11 @@ EOF
 # --- Execution ---
 # ---------------------------------------------------------------------------
 main() {
+    # Pipe-safety: curl | bash chiếm stdin, reopen từ /dev/tty
+    if [ ! -t 0 ]; then
+        exec < /dev/tty
+    fi
+
     prompt_config
     prep_system
     deploy_stack
