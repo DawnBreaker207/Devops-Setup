@@ -208,7 +208,7 @@ EOF
 
     if ! sudo systemctl is-active --quiet cloudflared 2>/dev/null; then
         info "Installing cloudflared as a system service..."
-        sudo cloudflared service install
+        sudo cloudflared --config "$CF_CONFIG_DIR/config.yml" service install
         sudo systemctl enable cloudflared
         sudo systemctl start cloudflared
     else
