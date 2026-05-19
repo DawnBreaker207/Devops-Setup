@@ -9,7 +9,7 @@ CF_CONFIG_DIR="$HOME/.cloudflared"
 info() { printf "%b[INFO]%b %s\n" "\e[34m" "\e[0m" "$1"; }
 ok()   { printf "%b[OK]%b   %s\n" "\e[32m" "\e[0m" "$1"; }
 warn() { printf "%b[WARN]%b %s\n" "\e[33m" "\e[0m" "$1"; }
-ask()  { printf "%b[INPUT]%b %s: " "\e[35m" "\e[0m" "$1"; }
+ask()  { printf "%b[INPUT]%b %s: " "\e[35m" "\e[0m" "$1" > /dev/tty; }
 
 prompt_config() {
     echo "=============================================="
