@@ -325,10 +325,14 @@ EOF
 # ---------------------------------------------------------------------------
 main() {
     # Pipe-safety: nếu chạy qua "curl ... | bash", stdin bị curl chiếm.
-    # Phát hiện và re-exec với stdin gắn vào terminal thật (/dev/tty).
+    # Tải script về file tạm rồi chạy lại từ disk với stdin gắn vào /dev/tty.
     if [ ! -t 0 ]; then
-        warn "Detected piped stdin — re-executing with interactive terminal..."
-        exec bash /dev/stdin "$@" < /dev/tty
+        warn "Detected piped stdin — downloading and re-executing from disk..."
+        local _tmp
+        _tmp=$(mktemp /tmp/setup-infra.XXXXXX.sh)
+        curl -fsSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/main/setup.sh -o "$_tmp"
+        chmod +x "$_tmp"
+        exec bash "$_tmp" "$@" < /dev/tty
     fi
 
     prompt_config
