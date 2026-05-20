@@ -175,12 +175,14 @@ configure_pipeline_deps() {
     # With bind mount, Jenkins home path is known directly — no need for docker volume inspect
     local vol_path="$JENKINS_HOME"
 
+    # Wait for Jenkins to be ready.
     info "Waiting for Jenkins to initialize..."
-    until sudo test -d "$vol_path/secrets"; do
+    until sudo test -f "$vol_path/config.xml" || sudo test -d "$vol_path/secrets"; do
         printf "."
         sleep 2
     done
     echo ""
+    ok "Jenkins is ready."
 
     if ! sudo test -f "$vol_path/.ssh/id_ed25519"; then
         info "Injecting SSH keys into Jenkins home..."
@@ -352,8 +354,14 @@ main() {
 
     ok "Infrastructure is up!"
     echo "======================================================"
-    echo "Jenkins Admin Password:"
-    sudo cat "${JENKINS_HOME}/secrets/initialAdminPassword"
+    # initialAdminPassword only exists before the setup wizard is completed.
+    # On subsequent runs it will be absent — handle both cases gracefully.
+    if sudo test -f "${JENKINS_HOME}/secrets/initialAdminPassword"; then
+        echo "Jenkins Admin Password:"
+        sudo cat "${JENKINS_HOME}/secrets/initialAdminPassword"
+    else
+        echo "Jenkins Admin Password: (already configured — check Jenkins UI)"
+    fi
     echo "======================================================"
     echo "Public SSH Key (Add to GitHub):"
     cat ~/.ssh/id_ed25519.pub
