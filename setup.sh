@@ -172,10 +172,22 @@ configure_pipeline_deps() {
         ok "SSH key already exists."
     fi
 
-    # With bind mount, Jenkins home path is known directly — no need for docker volume inspect
-    local vol_path="$JENKINS_HOME"
+    # Auto-detect Jenkins home from the actual mount source — works for both
+    # bind mounts and named volumes, so the script is resilient to pre-existing
+    # containers that were not created with the expected bind mount path.
+    local vol_path
+    vol_path=$(docker inspect jenkins \
+        --format '{{range .Mounts}}{{if eq .Destination "/var/jenkins_home"}}{{.Source}}{{end}}{{end}}')
+    if [ -z "$vol_path" ]; then
+        err "Cannot detect Jenkins home path. Is the container running?"
+        exit 1
+    fi
+    info "Jenkins home detected at: $vol_path"
 
     # Wait for Jenkins to be ready.
+    # Use config.xml as the readiness signal — it is created on first boot and
+    # persists after the setup wizard, unlike secrets/ which may be absent on
+    # subsequent runs.
     info "Waiting for Jenkins to initialize..."
     until sudo test -f "$vol_path/config.xml" || sudo test -d "$vol_path/secrets"; do
         printf "."
@@ -356,9 +368,12 @@ main() {
     echo "======================================================"
     # initialAdminPassword only exists before the setup wizard is completed.
     # On subsequent runs it will be absent — handle both cases gracefully.
-    if sudo test -f "${JENKINS_HOME}/secrets/initialAdminPassword"; then
+    local jenkins_vol
+    jenkins_vol=$(docker inspect jenkins \
+        --format '{{range .Mounts}}{{if eq .Destination "/var/jenkins_home"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || echo "")
+    if [ -n "$jenkins_vol" ] && sudo test -f "${jenkins_vol}/secrets/initialAdminPassword"; then
         echo "Jenkins Admin Password:"
-        sudo cat "${JENKINS_HOME}/secrets/initialAdminPassword"
+        sudo cat "${jenkins_vol}/secrets/initialAdminPassword"
     else
         echo "Jenkins Admin Password: (already configured — check Jenkins UI)"
     fi
