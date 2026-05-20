@@ -36,6 +36,8 @@ rollback_all() {
 trap 'rollback_all' ERR
 
 # ---------------------------------------------------------------------------
+# Prompt user for configuration values before setup begins
+# ---------------------------------------------------------------------------
 prompt_config() {
     echo "=============================================="
     echo "         Infrastructure Setup Config"
@@ -66,9 +68,10 @@ prompt_config() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. System Prereqs
+# 1. System Prerequisites
 # ---------------------------------------------------------------------------
 prep_system() {
+    # Install Docker Engine if not present
     info "Checking Docker..."
     if ! command -v docker &> /dev/null; then
         warn "Docker not found. Installing..."
@@ -79,6 +82,7 @@ prep_system() {
         ok "Docker already installed."
     fi
 
+    # Ensure the Docker socket is accessible by the current user and containers
     info "Checking Docker socket permissions..."
     local current_perms
     current_perms=$(stat -c "%a" /var/run/docker.sock 2>/dev/null || echo "000")
@@ -86,6 +90,7 @@ prep_system() {
         local old_perms="$current_perms"
         sudo chmod 666 /var/run/docker.sock
         push_rollback "sudo chmod ${old_perms} /var/run/docker.sock"
+        # Persist the permission across reboots via a udev rule
         if [ ! -f /etc/udev/rules.d/docker-socket.rules ]; then
             echo 'KERNEL=="docker.sock", MODE="0666"' | sudo tee /etc/udev/rules.d/docker-socket.rules > /dev/null
             sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -95,6 +100,7 @@ prep_system() {
         ok "Docker socket permissions already correct."
     fi
 
+    # Create a shared Docker network for all infra containers
     if ! docker network inspect "$NET" >/dev/null 2>&1; then
         docker network create "$NET"
         push_rollback "docker network rm '$NET' 2>/dev/null || true"
@@ -102,6 +108,7 @@ prep_system() {
         ok "Network '$NET' already exists."
     fi
 
+    # Install cloudflared CLI for tunnel management
     info "Checking cloudflared..."
     if ! command -v cloudflared &> /dev/null; then
         warn "cloudflared not found. Installing..."
@@ -123,6 +130,8 @@ prep_system() {
 # ---------------------------------------------------------------------------
 # 2. Container Orchestration
 # ---------------------------------------------------------------------------
+
+# Generic helper: run a container only if it does not already exist
 launch_container() {
     local name=$1
     local args=$2
@@ -137,26 +146,32 @@ launch_container() {
 }
 
 deploy_stack() {
+    # Portainer — Docker management UI
     info "Deploying Portainer..."
     launch_container "portainer" "-p 8000:8000 -p 9443:9443 -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:latest"
 
+    # Nginx Proxy Manager — reverse proxy with Let's Encrypt support
     info "Deploying Nginx Proxy Manager..."
     launch_container "nginx-proxy-manager" "-p 80:80 -p 81:81 -p 443:443 -v npm_data:/data -v npm_letsencrypt:/etc/letsencrypt jc21/nginx-proxy-manager:latest"
 
+    # Jenkins — CI/CD automation server
     info "Deploying Jenkins..."
     launch_container "jenkins" "-p 8080:8080 -p 50000:50000 -v ${JENKINS_HOME}:/var/jenkins_home -v /var/run/docker.sock:/var/run/docker.sock jenkins/jenkins:lts"
 
+    # Uptime Kuma — service uptime monitoring
     info "Deploying Uptime Kuma..."
     launch_container "uptime-kuma" "-p 3001:3001 -v uptime_kuma_data:/app/data -v /var/run/docker.sock:/var/run/docker.sock louislam/uptime-kuma:latest"
 
+    # Watchtower — auto-updates running containers daily at 04:00
     info "Deploying Watchtower..."
     launch_container "watchtower" "-v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower --schedule \"0 0 4 * * *\" --cleanup"
 }
 
 # ---------------------------------------------------------------------------
-# 3. Jenkins & Git Config
+# 3. Jenkins Pipeline Dependencies
 # ---------------------------------------------------------------------------
 configure_pipeline_deps() {
+    # Generate an SSH key pair for authenticating with GitHub
     info "Preparing SSH keys for GitHub..."
     if [ ! -f ~/.ssh/id_ed25519 ]; then
         ssh-keygen -t ed25519 -C "$GITHUB_EMAIL" -N "" -f ~/.ssh/id_ed25519
@@ -165,6 +180,7 @@ configure_pipeline_deps() {
         ok "SSH key already exists."
     fi
 
+    # Wait until Jenkins has fully initialized its home directory
     info "Waiting for Jenkins to initialize volume..."
     local vol_path
     vol_path=$(docker volume inspect "$JENKINS_HOME" -f '{{.Mountpoint}}')
@@ -175,6 +191,7 @@ configure_pipeline_deps() {
     done
     echo ""
 
+    # Inject the SSH key into the Jenkins volume so pipelines can access GitHub
     if ! sudo test -f "$vol_path/.ssh/id_ed25519"; then
         info "Injecting SSH keys into Jenkins volume..."
         sudo mkdir -p "$vol_path/.ssh"
@@ -187,12 +204,49 @@ configure_pipeline_deps() {
         ok "SSH keys already injected into Jenkins volume."
     fi
 
+    # Install Docker CLI binary inside Jenkins container
     info "Checking Docker CLI inside Jenkins container..."
     if ! docker exec jenkins bash -c "command -v docker" &>/dev/null; then
-        docker exec -u root jenkins bash -c "apt-get update -qq && apt-get install -y -qq docker.io"
+        info "Installing Docker CLI binary inside Jenkins container..."
+        docker exec -u root jenkins bash -c "apt-get update -qq && apt-get install -y -qq curl"
+        docker exec -u root jenkins bash -c "
+            curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+                | tar -xz --strip-components=1 -C /usr/local/bin docker/docker && \
+            chmod +x /usr/local/bin/docker
+        "
+        push_rollback "docker exec -u root jenkins rm -f /usr/local/bin/docker 2>/dev/null || true"
+        ok "Docker CLI installed in Jenkins."
     else
         ok "Docker CLI already installed in Jenkins."
     fi
+
+    # Install Docker Compose v2 as a CLI plugin inside Jenkins container
+    # Required for pipelines that run: docker compose up/down
+    info "Checking Docker Compose v2 plugin inside Jenkins container..."
+    if ! docker exec jenkins bash -c "docker compose version" &>/dev/null; then
+        info "Installing Docker Compose v2 plugin inside Jenkins container..."
+        docker exec -u root jenkins bash -c "
+            mkdir -p /usr/local/lib/docker/cli-plugins && \
+            curl -fsSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+                -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+            chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+        "
+        push_rollback "docker exec -u root jenkins rm -f /usr/local/lib/docker/cli-plugins/docker-compose 2>/dev/null || true"
+        ok "Docker Compose v2 plugin installed in Jenkins."
+    else
+        ok "Docker Compose v2 already available in Jenkins."
+    fi
+
+    # Configure Jenkins workspace permissions
+    info "Configuring Jenkins workspace permissions..."
+    docker exec -u root jenkins bash -c "
+        echo 'umask 002' > /etc/profile.d/jenkins-umask.sh && \
+        chmod +x /etc/profile.d/jenkins-umask.sh
+    "
+    sudo chown -R 1000:1000 "$vol_path/workspace" 2>/dev/null || true
+    sudo chmod -R u+rwX "$vol_path/workspace" 2>/dev/null || true
+    push_rollback "docker exec -u root jenkins rm -f /etc/profile.d/jenkins-umask.sh 2>/dev/null || true"
+    ok "Jenkins workspace permissions configured."
 }
 
 # ---------------------------------------------------------------------------
@@ -202,6 +256,7 @@ configure_cloudflare_tunnel() {
     info "Configuring Cloudflare Tunnel..."
     mkdir -p "$CF_CONFIG_DIR"
 
+    # Authenticate with Cloudflare — opens a browser for one-time login
     if [ ! -f "$CF_CONFIG_DIR/cert.pem" ]; then
         info "Logging in to Cloudflare (browser will open)..."
         cloudflared tunnel login
@@ -210,6 +265,7 @@ configure_cloudflare_tunnel() {
         ok "Cloudflare cert already exists. Skipping login."
     fi
 
+    # Create the tunnel if it does not already exist
     if ! cloudflared tunnel list 2>/dev/null | awk '{print $2}' | grep -qx "$CF_TUNNEL_NAME"; then
         info "Creating tunnel: $CF_TUNNEL_NAME"
         cloudflared tunnel create "$CF_TUNNEL_NAME"
@@ -218,7 +274,7 @@ configure_cloudflare_tunnel() {
         ok "Tunnel '$CF_TUNNEL_NAME' already exists."
     fi
 
-    # --- FIX: exact-match tunnel ID, validate credentials file ---
+    # Resolve the tunnel ID with an exact name match to avoid partial matches
     local TUNNEL_ID
     TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | awk -v name="$CF_TUNNEL_NAME" '$2==name {print $1}')
     if [ -z "$TUNNEL_ID" ]; then
@@ -226,6 +282,7 @@ configure_cloudflare_tunnel() {
         exit 1
     fi
 
+    # Verify the credentials file exists for this tunnel ID
     local CREDS_FILE="$CF_CONFIG_DIR/${TUNNEL_ID}.json"
     if [ ! -f "$CREDS_FILE" ]; then
         err "Credentials file not found: $CREDS_FILE"
@@ -233,7 +290,7 @@ configure_cloudflare_tunnel() {
         exit 1
     fi
 
-    # --- FIX: kiểm tra config hiện tại có đúng tunnel ID không ---
+    # Write the tunnel config only if it is missing or points to a different tunnel ID
     local CONFIG_FILE="$CF_CONFIG_DIR/config.yml"
     local EXISTING_ID=""
     if [ -f "$CONFIG_FILE" ]; then
@@ -280,6 +337,7 @@ EOF
         ok "Tunnel config already exists and tunnel ID matches. Skipping."
     fi
 
+    # Copy config to system path and install/restart the cloudflared service
     sudo mkdir -p /etc/cloudflared
     sudo cp "$CF_CONFIG_DIR/config.yml" /etc/cloudflared/config.yml
 
@@ -296,7 +354,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# --- Execution ---
+# Main Entrypoint
 # ---------------------------------------------------------------------------
 main() {
     prompt_config
