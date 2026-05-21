@@ -50,28 +50,101 @@ Required Credentials — go to **Manage Jenkins → Credentials → Add**:
 
 SSH into the home server from any machine via Cloudflare Tunnel — no open ports or NAT required.
 
-### Prerequisites
+### Step 1 — Verify DNS record exists on the server
 
-Install `cloudflared` on your **client machine**:
-
-**macOS**
+Before setting up the client, confirm the DNS CNAME for `ssh.<YOUR_DOMAIN>` has been registered. Run this on the **server**:
 
 ```bash
-brew install cloudflare/cloudflare/cloudflared
+dig ssh.<YOUR_DOMAIN>
 ```
 
-**Linux (Debian/Ubuntu)**
+The output must have an `ANSWER SECTION` with a CNAME pointing to `*.cfargotunnel.com`. If you see `NXDOMAIN` (no answer), the record is missing — register it manually:
 
+```bash
+cloudflared tunnel route dns <TUNNEL_NAME> ssh.<YOUR_DOMAIN>
+```
+
+> **Common mistake:** the domain you see in the output log may differ from what you typed. For example, `cloudflared tunnel route dns VPS ssh.dawn.io.com` might actually create `ssh.dawn.io.vn` if your registered domain is `dawn.io.vn`. Always read the log line carefully:
+> ```
+> INF Added CNAME ssh.dawn.io.vn which will route to this tunnel
+> ```
+> Use the domain from that log line everywhere below, not what you typed.
+
+---
+
+### Step 2 — Install `cloudflared` on the client machine
+
+**Linux (Debian/Ubuntu)**
 ```bash
 curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
 sudo dpkg -i /tmp/cloudflared.deb
 ```
 
-**Windows** — download the installer from [cloudflare/cloudflared releases](https://github.com/cloudflare/cloudflared/releases/latest)
+Verify:
+```bash
+cloudflared --version
+```
 
-### Configure SSH ProxyCommand
+**macOS**
+```bash
+brew install cloudflare/cloudflare/cloudflared
+```
 
-Add the following to your `~/.ssh/config` (create the file if it doesn't exist):
+**Windows** — download the installer from [cloudflare/cloudflared releases](https://github.com/cloudflare/cloudflared/releases/latest), run it, then open a new PowerShell window and verify:
+```powershell
+cloudflared --version
+```
+
+---
+
+### Step 3 — Generate SSH key pair on the client
+
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+ssh-keygen -t ed25519 -C "your@email.com"
+```
+
+When prompted, press **Enter** three times to accept defaults (do not type a path manually):
+
+```
+Enter file in which to save the key (/home/youruser/.ssh/id_ed25519): [Enter]
+Enter passphrase (empty for no passphrase): [Enter]
+Enter same passphrase again: [Enter]
+```
+
+Verify both files were created:
+```bash
+ls ~/.ssh/
+# Expected: id_ed25519  id_ed25519.pub
+```
+
+> **Note:** When `ssh-keygen` asks for the file path interactively, do not type `~/.ssh/id_ed25519` — the shell does not expand `~` here and the command will fail with `No such file or directory`. Just press Enter to use the default.
+
+---
+
+### Step 4 — Add the client public key to the server
+
+Print your public key:
+```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+Copy the entire output, then on the **server** run:
+```bash
+echo "paste_your_public_key_here" >> ~/.ssh/authorized_keys
+```
+
+The setup script pre-creates `~/.ssh/authorized_keys` with correct permissions, so no `chmod` is needed.
+
+---
+
+### Step 5 — Configure SSH on the client
+
+```bash
+nano ~/.ssh/config
+```
+
+Paste the following, replacing the placeholders:
 
 ```ssh-config
 Host ssh.<YOUR_DOMAIN>
@@ -81,30 +154,48 @@ Host ssh.<YOUR_DOMAIN>
   ProxyCommand cloudflared access ssh --hostname %h
 ```
 
-Replace:
+- `<YOUR_DOMAIN>` — the actual domain from the DNS log in Step 1 (e.g. `domain.gg`)
+- `<SSH_USER>` — your Linux username on the server (e.g. `dawnbreaker`)
 
-- `<YOUR_DOMAIN>` — the domain you entered during setup (e.g. `example.com`)
-- `<SSH_USER>` — the Linux username on the server (the one you entered during setup)
-
-### Add Your Public Key to the Server
-
-The server's `~/.ssh/authorized_keys` is pre-created by the setup script. You need to add your **client's** public key to it.
-
-If you don't have an SSH key pair on your client, generate one first:
+Save: `Ctrl+O` → `Enter` → `Ctrl+X`, then lock down permissions:
 
 ```bash
-ssh-keygen -t ed25519 -C "your@email.com"
+chmod 600 ~/.ssh/config
 ```
 
-Then copy the content of `~/.ssh/id_ed25519.pub` on your client and append it to `~/.ssh/authorized_keys` on the server — you can do this manually or via any existing access method.
+**Windows** — create the file at `C:\Users\<youruser>\.ssh\config` using Notepad or VSCode. The `ProxyCommand` line must include the full path to `cloudflared.exe` if it contains spaces:
 
-### Connect
+```ssh-config
+Host ssh.<YOUR_DOMAIN>
+  HostName ssh.<YOUR_DOMAIN>
+  User <SSH_USER>
+  IdentityFile ~/.ssh/id_ed25519
+  ProxyCommand "C:\Program Files\cloudflared\cloudflared.exe" access ssh --hostname %h
+```
+
+Find the correct path with:
+```powershell
+where.exe cloudflared
+```
+
+---
+
+### Step 6 — Connect
 
 ```bash
 ssh ssh.<YOUR_DOMAIN>
 ```
 
-`cloudflared` will handle the tunnel transparently. The connection goes through Cloudflare without any open ports on your router.
+`cloudflared` intercepts the connection and routes it through the Cloudflare Tunnel transparently. No ports need to be open on the router.
+
+#### Troubleshooting
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Could not resolve hostname` | DNS record missing or wrong domain | Re-check Step 1, use the domain from the CNAME log |
+| `Connection refused` | `sshd` not running on server | `sudo systemctl start ssh` on server |
+| `Permission denied (publickey)` | Public key not in `authorized_keys` | Re-do Step 4 |
+| `too many arguments` (Windows) | Space in `cloudflared.exe` path, missing quotes | Wrap full path in double quotes in `ProxyCommand` |
 
 ---
 
