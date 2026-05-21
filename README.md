@@ -46,7 +46,69 @@ Required Credentials — go to **Manage Jenkins → Credentials → Add**:
 | `pro.env`         | Secret File     | upload your production `.env` file |
 | `discord-webhook` | Secret text     | Discord Webhook URL                |
 
-## 4. CI/CD Pipeline
+## 4. Remote SSH Access (Client Setup)
+
+SSH into the home server from any machine via Cloudflare Tunnel — no open ports or NAT required.
+
+### Prerequisites
+
+Install `cloudflared` on your **client machine**:
+
+**macOS**
+
+```bash
+brew install cloudflare/cloudflare/cloudflared
+```
+
+**Linux (Debian/Ubuntu)**
+
+```bash
+curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+sudo dpkg -i /tmp/cloudflared.deb
+```
+
+**Windows** — download the installer from [cloudflare/cloudflared releases](https://github.com/cloudflare/cloudflared/releases/latest)
+
+### Configure SSH ProxyCommand
+
+Add the following to your `~/.ssh/config` (create the file if it doesn't exist):
+
+```ssh-config
+Host ssh.<YOUR_DOMAIN>
+  HostName ssh.<YOUR_DOMAIN>
+  User <SSH_USER>
+  IdentityFile ~/.ssh/id_ed25519
+  ProxyCommand cloudflared access ssh --hostname %h
+```
+
+Replace:
+
+- `<YOUR_DOMAIN>` — the domain you entered during setup (e.g. `example.com`)
+- `<SSH_USER>` — the Linux username on the server (the one you entered during setup)
+
+### Add Your Public Key to the Server
+
+The server's `~/.ssh/authorized_keys` is pre-created by the setup script. You need to add your **client's** public key to it.
+
+If you don't have an SSH key pair on your client, generate one first:
+
+```bash
+ssh-keygen -t ed25519 -C "your@email.com"
+```
+
+Then copy the content of `~/.ssh/id_ed25519.pub` on your client and append it to `~/.ssh/authorized_keys` on the server — you can do this manually or via any existing access method.
+
+### Connect
+
+```bash
+ssh ssh.<YOUR_DOMAIN>
+```
+
+`cloudflared` will handle the tunnel transparently. The connection goes through Cloudflare without any open ports on your router.
+
+---
+
+## 5. CI/CD Pipeline
 
 ### Step 1 — Create `deploy.config` in your project repo
 
