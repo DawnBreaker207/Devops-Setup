@@ -53,10 +53,15 @@ prompt_config() {
     ask "Your Domain (e.g. example.com) — leave blank to skip tunnel ingress"
     read -r USER_DOMAIN < /dev/tty
 
+    ask "SSH username on this server (default: $USER)"
+    read -r SSH_USER < /dev/tty
+    SSH_USER="${SSH_USER:-$USER}"
+
     echo "----------------------------------------------"
     echo "  GitHub Email : $GITHUB_EMAIL"
     echo "  Tunnel Name  : $CF_TUNNEL_NAME"
     echo "  Domain       : ${USER_DOMAIN:-"(skipped)"}"
+    echo "  SSH User     : $SSH_USER"
     echo "----------------------------------------------"
     ask "Confirm? (y/n)"
     read -r CONFIRM < /dev/tty
@@ -254,7 +259,49 @@ configure_pipeline_deps() {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Cloudflare Tunnel
+# 4. SSH Server
+# ---------------------------------------------------------------------------
+configure_ssh_server() {
+    info "Checking SSH daemon (sshd)..."
+
+    # Cài openssh-server nếu chưa có
+    if ! command -v sshd &>/dev/null; then
+        warn "openssh-server not found. Installing..."
+        sudo apt-get install -y openssh-server
+        push_rollback "sudo apt-get remove -y openssh-server 2>/dev/null || true"
+    else
+        ok "openssh-server already installed."
+    fi
+
+    # Bật và start service
+    if ! sudo systemctl is-enabled ssh &>/dev/null; then
+        sudo systemctl enable ssh
+        push_rollback "sudo systemctl disable ssh 2>/dev/null || true"
+    fi
+
+    if ! sudo systemctl is-active --quiet ssh; then
+        sudo systemctl start ssh
+        push_rollback "sudo systemctl stop ssh 2>/dev/null || true"
+    fi
+
+    # Xác nhận đang listen :22
+    if ss -tlnp | grep -q ':22'; then
+        ok "SSH daemon is listening on port 22."
+    else
+        err "SSH daemon is not listening on port 22 after start attempt."
+        exit 1
+    fi
+
+    # Tạo ~/.ssh/authorized_keys nếu chưa có (để client có thể inject key)
+    mkdir -p "$HOME/.ssh"
+    touch "$HOME/.ssh/authorized_keys"
+    chmod 700 "$HOME/.ssh"
+    chmod 600 "$HOME/.ssh/authorized_keys"
+    ok "~/.ssh/authorized_keys is ready."
+}
+
+# ---------------------------------------------------------------------------
+# 5. Cloudflare Tunnel
 # ---------------------------------------------------------------------------
 configure_cloudflare_tunnel() {
     info "Configuring Cloudflare Tunnel..."
@@ -319,9 +366,11 @@ ingress:
     service: http://localhost:81
   - hostname: uptime.${USER_DOMAIN}
     service: http://localhost:3001
+  - hostname: ssh.${USER_DOMAIN}
+    service: ssh://localhost:22
   - service: http_status:404
 EOF
-            ok "Tunnel config written with domain: $USER_DOMAIN"
+            ok "Tunnel config written with domain: $USER_DOMAIN (includes SSH ingress)"
         else
             cat > "$CONFIG_FILE" <<EOF
 tunnel: ${TUNNEL_ID}
@@ -335,6 +384,27 @@ EOF
         push_rollback "rm -f '$CONFIG_FILE'"
     else
         ok "Tunnel config already exists and tunnel ID matches. Skipping."
+
+        # Bổ sung SSH ingress vào config hiện có nếu chưa có
+        if [ -n "${USER_DOMAIN:-}" ] && ! grep -q "ssh://localhost:22" "$CONFIG_FILE"; then
+            warn "Existing config missing SSH ingress — patching..."
+            local ESCAPED_DOMAIN
+            ESCAPED_DOMAIN=$(printf '%s' "$USER_DOMAIN" | sed 's/\./\\./g')
+            sed -i "s|  - service: http_status:404|  - hostname: ssh.${ESCAPED_DOMAIN}\n    service: ssh://localhost:22\n  - service: http_status:404|" "$CONFIG_FILE"
+            ok "SSH ingress rule patched into existing config."
+        else
+            ok "SSH ingress rule already present in config."
+        fi
+    fi
+
+    # Đăng ký DNS record cho SSH subdomain
+    if [ -n "${USER_DOMAIN:-}" ]; then
+        info "Registering DNS CNAME for ssh.${USER_DOMAIN}..."
+        if cloudflared tunnel route dns "$CF_TUNNEL_NAME" "ssh.${USER_DOMAIN}" 2>/dev/null; then
+            ok "DNS record created: ssh.${USER_DOMAIN}"
+        else
+            warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME ssh.${USER_DOMAIN}"
+        fi
     fi
 
     sudo mkdir -p /etc/cloudflared
@@ -360,6 +430,7 @@ main() {
     prep_system
     deploy_stack
     configure_pipeline_deps
+    configure_ssh_server
     configure_cloudflare_tunnel
 
     trap - ERR
@@ -385,6 +456,9 @@ main() {
     echo "Tunnel Status            : sudo systemctl status cloudflared"
     echo "Uptime Kuma              : http://localhost:3001"
     echo "Watchtower               : auto-update daily at 04:00"
+    if [ -n "${USER_DOMAIN:-}" ]; then
+    echo "SSH Tunnel               : ssh.${USER_DOMAIN}"
+    fi
     echo "======================================================"
 }
 
