@@ -244,7 +244,8 @@ configure_pipeline_deps() {
     else
         ok "Docker Compose v2 already available in Jenkins."
     fi
-
+    
+    docker exec -u root jenkins chmod 666 /var/run/docker.sock
     info "Configuring Jenkins workspace permissions..."
     # umask 002: new files default to 664, preventing read-only files (e.g. .env)
     # from blocking future pipeline runs that need to overwrite them
