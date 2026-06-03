@@ -8,6 +8,10 @@ Run this on a clean Ubuntu 24.04 LTS server:
 curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/main/setup.sh | bash
 ```
 
+or you can use:
+```bash
+wget -qO- https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/main/setup.sh | bash
+```
 The script will prompt for:
 
 - **GitHub Email** — used to generate SSH key
