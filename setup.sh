@@ -2,14 +2,11 @@
 set -euo pipefail
 
 NET="infra_network"
-JENKINS_HOME="/var/jenkins_home"
 CF_CONFIG_DIR="$HOME/.cloudflared"
 
 CLOUDFLARED_VERSION="2025.2.0"
 DOCKER_COMPOSE_VERSION="2.32.1"
-JENKINS_VERSION="2.492.3-lts-jdk17"
 PORTAINER_VERSION="2.27.3"
-NPM_VERSION="2.11.1"
 UPTIME_KUMA_VERSION="1.23.16"
 WATCHTOWER_VERSION="1.7.1"
 
@@ -20,26 +17,44 @@ err()  { printf "%b[ERR]%b  %s\n" "\e[31m" "\e[0m" "$1"; }
 ask()  { printf "%b[INPUT]%b %s: " "\e[35m" "\e[0m" "$1" > /dev/tty; }
 
 # ============================================================================
-# Distro Contract — each distro branch implements these
+# Distro Contract — Rocky Linux (dnf-based)
 # ============================================================================
-__not_implemented() {
-    err "Contract function '$1' is not implemented on this branch."
-    err "Switch to a distro branch: git checkout ubuntu | rocky"
-    exit 1
+pkg_update()    { sudo dnf check-update -q || true; }
+pkg_install()   { sudo dnf install -y "$@"; }
+pkg_remove()    { sudo dnf remove -y "$@" 2>/dev/null || true; }
+svc_name_sshd() { echo "sshd"; }
+svc_enable()    { sudo systemctl enable --now "$1"; }
+svc_disable()   { sudo systemctl disable --now "$1" 2>/dev/null || true; }
+svc_restart()   { sudo systemctl restart "$1"; }
+
+install_cloudflared() {
+    local version="$1"
+    local arch
+    arch=$(uname -m)
+    [[ "$arch" == "x86_64" ]] && arch="amd64" || arch="arm64"
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm
+    sudo rpm -i /tmp/cloudflared.rpm && rm -f /tmp/cloudflared.rpm
 }
 
-pkg_update()                 { __not_implemented "${FUNCNAME[0]}"; }
-pkg_install()                { __not_implemented "${FUNCNAME[0]}"; }
-pkg_remove()                 { __not_implemented "${FUNCNAME[0]}"; }
-svc_name_sshd()              { __not_implemented "${FUNCNAME[0]}"; }
-svc_enable()                 { __not_implemented "${FUNCNAME[0]}"; }
-svc_disable()                { __not_implemented "${FUNCNAME[0]}"; }
-svc_restart()                { __not_implemented "${FUNCNAME[0]}"; }
-install_cloudflared()        { __not_implemented "${FUNCNAME[0]}"; }
-remove_cloudflared()         { __not_implemented "${FUNCNAME[0]}"; }
-firewall_allow_port()        { __not_implemented "${FUNCNAME[0]}"; }
-firewall_deny_port()         { __not_implemented "${FUNCNAME[0]}"; }
-selinux_apply_context()      { __not_implemented "${FUNCNAME[0]}"; }
+remove_cloudflared()         { sudo dnf remove -y cloudflared 2>/dev/null || true; }
+
+firewall_allow_port() {
+    if command -v firewall-cmd &>/dev/null; then
+        sudo firewall-cmd --permanent --add-port="$1" && sudo firewall-cmd --reload
+    fi
+}
+
+firewall_deny_port() {
+    if command -v firewall-cmd &>/dev/null; then
+        sudo firewall-cmd --permanent --remove-port="$1" && sudo firewall-cmd --reload
+    fi
+}
+
+selinux_apply_context() {
+    if command -v selinuxenabled &>/dev/null && selinuxenabled; then
+        sudo chcon -Rt container_file_t "$1" 2>/dev/null || true
+    fi
+}
 
 # ============================================================================
 # Rollback
@@ -161,7 +176,62 @@ launch_container() {
 }
 
 # ============================================================================
-# 3. Cloudflare Tunnel
+# 3. Container Orchestration
+# ============================================================================
+deploy_stack() {
+    info "Deploying Portainer..."
+    launch_container "portainer" "-p 8000:8000 -p 9443:9443 --group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:${PORTAINER_VERSION}"
+
+    info "Deploying Uptime Kuma..."
+    launch_container "uptime-kuma" "-p 3001:3001 --group-add ${DOCKER_SOCKET_GID} -v uptime_kuma_data:/app/data -v /var/run/docker.sock:/var/run/docker.sock louislam/uptime-kuma:${UPTIME_KUMA_VERSION}"
+
+    info "Deploying Watchtower..."
+    launch_container "watchtower" "--group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:${WATCHTOWER_VERSION} --schedule \"0 0 4 * * *\" --cleanup"
+
+    firewall_allow_port 9443/tcp
+    firewall_allow_port 3001/tcp
+}
+
+# ============================================================================
+# 4. SSH Server
+# ============================================================================
+configure_ssh_server() {
+    info "Checking SSH daemon (sshd)..."
+    if ! command -v sshd &>/dev/null; then
+        warn "openssh-server not found. Installing..."
+        pkg_update
+        pkg_install openssh-server
+        push_rollback "pkg_remove openssh-server"
+    else
+        ok "openssh-server already installed."
+    fi
+
+    local sshd_svc
+    sshd_svc=$(svc_name_sshd)
+
+    if ! sudo systemctl is-enabled "$sshd_svc" &>/dev/null || ! sudo systemctl is-active --quiet "$sshd_svc"; then
+        svc_enable "$sshd_svc"
+        push_rollback "svc_disable $sshd_svc"
+    fi
+
+    if ss -tlnp | grep -q ':22'; then
+        ok "SSH daemon is listening on port 22."
+    else
+        err "SSH daemon is not listening on port 22 after start attempt."
+        exit 1
+    fi
+
+    mkdir -p "$HOME/.ssh"
+    touch "$HOME/.ssh/authorized_keys"
+    chmod 700 "$HOME/.ssh"
+    chmod 600 "$HOME/.ssh/authorized_keys"
+    ok "~/.ssh/authorized_keys is ready."
+
+    firewall_allow_port 22/tcp
+}
+
+# ============================================================================
+# 5. Cloudflare Tunnel
 # ============================================================================
 configure_cloudflare_tunnel() {
     info "Configuring Cloudflare Tunnel..."
@@ -218,14 +288,10 @@ tunnel: ${TUNNEL_ID}
 credentials-file: ${CREDS_FILE}
 
 ingress:
-  - hostname: jenkins.${USER_DOMAIN}
-    service: http://localhost:8080
   - hostname: portainer.${USER_DOMAIN}
     service: https://localhost:9443
     originRequest:
       noTLSVerify: true
-  - hostname: npm.${USER_DOMAIN}
-    service: http://localhost:81
   - hostname: uptime.${USER_DOMAIN}
     service: http://localhost:3001
   - hostname: ssh.${USER_DOMAIN}
@@ -288,14 +354,34 @@ EOF
 main() {
     prompt_config
     prep_system
+    deploy_stack
+    configure_ssh_server
     configure_cloudflare_tunnel
 
     trap - ERR INT TERM
 
-    ok "Base infrastructure ready."
+    ok "Infrastructure is up!"
     echo "======================================================"
-    echo "Docker is installed and the infra network is created."
-    echo "Cloudflare Tunnel is configured."
+    echo "Cloudflare Tunnel Config : $CF_CONFIG_DIR/config.yml"
+    echo "Tunnel Status            : sudo systemctl status cloudflared"
+    echo "Portainer                : https://localhost:9443"
+    echo "Uptime Kuma              : http://localhost:3001"
+    echo "Watchtower               : auto-update daily at 04:00"
+    if [ -n "${USER_DOMAIN:-}" ]; then
+    echo "SSH Tunnel               : ssh.${USER_DOMAIN}"
+    echo "Portainer                : https://portainer.${USER_DOMAIN}"
+    echo "Uptime Kuma              : https://uptime.${USER_DOMAIN}"
+    fi
+    echo "======================================================"
+    echo "!!!  DEFAULT CREDENTIALS — CHANGE IMMEDIATELY  !!!"
+    echo "  Portainer : set admin password on first login"
+    echo "======================================================"
+    echo ""
+    echo "Next step: add a GitHub Actions deploy key"
+    echo "  1. ssh-keygen -t ed25519 -C 'github-actions'"
+    echo "  2. cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys"
+    echo "  3. Add private key to GitHub repo Secrets as SSH_KEY"
+    echo "  4. Create .github/workflows/deploy.yml in your app repo"
     echo "======================================================"
 }
 
