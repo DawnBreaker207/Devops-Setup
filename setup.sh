@@ -20,26 +20,29 @@ err()  { printf "%b[ERR]%b  %s\n" "\e[31m" "\e[0m" "$1"; }
 ask()  { printf "%b[INPUT]%b %s: " "\e[35m" "\e[0m" "$1" > /dev/tty; }
 
 # ============================================================================
-# Distro Contract — each distro branch implements these
+# Distro Contract — Ubuntu (apt-based)
 # ============================================================================
-__not_implemented() {
-    err "Contract function '$1' is not implemented on this branch."
-    err "Switch to a distro branch: git checkout ubuntu | rocky"
-    exit 1
+pkg_update()    { sudo apt-get update -qq; }
+pkg_install()   { sudo apt-get install -y "$@"; }
+pkg_remove()    { sudo apt-get remove -y "$@" 2>/dev/null || true; }
+svc_name_sshd() { echo "ssh"; }
+svc_enable()    { sudo systemctl enable --now "$1"; }
+svc_disable()   { sudo systemctl disable --now "$1" 2>/dev/null || true; }
+svc_restart()   { sudo systemctl restart "$1"; }
+
+install_cloudflared() {
+    local version="$1"
+    local arch
+    arch=$(dpkg --print-architecture)
+    [[ "$arch" == "amd64" || "$arch" == "x86_64" ]] && arch="amd64" || arch="arm64"
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.deb" -o /tmp/cloudflared.deb
+    sudo dpkg -i /tmp/cloudflared.deb && rm -f /tmp/cloudflared.deb
 }
 
-pkg_update()                 { __not_implemented "${FUNCNAME[0]}"; }
-pkg_install()                { __not_implemented "${FUNCNAME[0]}"; }
-pkg_remove()                 { __not_implemented "${FUNCNAME[0]}"; }
-svc_name_sshd()              { __not_implemented "${FUNCNAME[0]}"; }
-svc_enable()                 { __not_implemented "${FUNCNAME[0]}"; }
-svc_disable()                { __not_implemented "${FUNCNAME[0]}"; }
-svc_restart()                { __not_implemented "${FUNCNAME[0]}"; }
-install_cloudflared()        { __not_implemented "${FUNCNAME[0]}"; }
-remove_cloudflared()         { __not_implemented "${FUNCNAME[0]}"; }
-firewall_allow_port()        { __not_implemented "${FUNCNAME[0]}"; }
-firewall_deny_port()         { __not_implemented "${FUNCNAME[0]}"; }
-selinux_apply_context()      { __not_implemented "${FUNCNAME[0]}"; }
+remove_cloudflared()         { sudo apt-get remove -y cloudflared 2>/dev/null || true; }
+firewall_allow_port()        { command -v ufw &>/dev/null && sudo ufw allow "$1" 2>/dev/null || true; }
+firewall_deny_port()         { command -v ufw &>/dev/null && sudo ufw deny "$1" 2>/dev/null || true; }
+selinux_apply_context()      { :; }
 
 # ============================================================================
 # Rollback
@@ -161,7 +164,165 @@ launch_container() {
 }
 
 # ============================================================================
-# 3. Cloudflare Tunnel
+# 3. Container Orchestration
+# ============================================================================
+deploy_stack() {
+    info "Deploying Portainer..."
+    launch_container "portainer" "-p 8000:8000 -p 9443:9443 --group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:${PORTAINER_VERSION}"
+
+    info "Deploying Nginx Proxy Manager..."
+    launch_container "nginx-proxy-manager" "-p 80:80 -p 81:81 -p 443:443 -v npm_data:/data -v npm_letsencrypt:/etc/letsencrypt jc21/nginx-proxy-manager:${NPM_VERSION}"
+
+    info "Deploying Jenkins..."
+    sudo mkdir -p "$JENKINS_HOME"
+    sudo chown -R 1000:1000 "$JENKINS_HOME"
+    selinux_apply_context "$JENKINS_HOME"
+    push_rollback "sudo rm -rf '$JENKINS_HOME'"
+    launch_container "jenkins" "-p 8080:8080 -p 50000:50000 --group-add ${DOCKER_SOCKET_GID} -v ${JENKINS_HOME}:${JENKINS_HOME} -v /var/run/docker.sock:/var/run/docker.sock jenkins/jenkins:${JENKINS_VERSION}"
+
+    info "Deploying Uptime Kuma..."
+    launch_container "uptime-kuma" "-p 3001:3001 --group-add ${DOCKER_SOCKET_GID} -v uptime_kuma_data:/app/data -v /var/run/docker.sock:/var/run/docker.sock louislam/uptime-kuma:${UPTIME_KUMA_VERSION}"
+
+    info "Deploying Watchtower..."
+    launch_container "watchtower" "--group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:${WATCHTOWER_VERSION} --schedule \"0 0 4 * * *\" --cleanup"
+
+    firewall_allow_port 80/tcp
+    firewall_allow_port 443/tcp
+    firewall_allow_port 8080/tcp
+    firewall_allow_port 9443/tcp
+    firewall_allow_port 3001/tcp
+    firewall_allow_port 81/tcp
+}
+
+# ============================================================================
+# 4. Jenkins Pipeline Dependencies
+# ============================================================================
+configure_pipeline_deps() {
+    info "Preparing SSH keys for GitHub..."
+    if [ ! -f ~/.ssh/id_ed25519 ]; then
+        ssh-keygen -t ed25519 -C "$GITHUB_EMAIL" -N "" -f ~/.ssh/id_ed25519
+        push_rollback "rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub"
+    else
+        ok "SSH key already exists."
+    fi
+
+    local vol_path
+    vol_path=$(docker inspect jenkins \
+        --format '{{range .Mounts}}{{if eq .Destination "/var/jenkins_home"}}{{.Source}}{{end}}{{end}}')
+    if [ -z "$vol_path" ]; then
+        err "Cannot detect Jenkins home path. Is the container running?"
+        exit 1
+    fi
+    info "Jenkins home detected at: $vol_path"
+
+    info "Waiting for Jenkins to initialize..."
+    local max_attempts=150
+    local attempt=0
+    until sudo test -f "$vol_path/config.xml" || sudo test -d "$vol_path/secrets"; do
+        attempt=$((attempt + 1))
+        if [ $attempt -ge $max_attempts ]; then
+            err "Jenkins failed to initialize within $((max_attempts * 2)) seconds."
+            exit 1
+        fi
+        printf "."
+        sleep 2
+    done
+    echo ""
+    ok "Jenkins is ready."
+
+    if ! sudo test -f "$vol_path/.ssh/id_ed25519"; then
+        info "Injecting SSH keys into Jenkins home..."
+        sudo mkdir -p "$vol_path/.ssh"
+        sudo cp ~/.ssh/id_ed25519* "$vol_path/.ssh/"
+        ssh-keyscan -t ed25519 github.com | sudo tee "$vol_path/.ssh/known_hosts" > /dev/null
+        sudo chown -R 1000:1000 "$vol_path/.ssh"
+        sudo chmod 700 "$vol_path/.ssh" && sudo chmod 600 "$vol_path/.ssh/id_ed25519"
+        push_rollback "sudo rm -rf '${vol_path}/.ssh'"
+    else
+        ok "SSH keys already injected into Jenkins home."
+    fi
+
+    info "Checking Docker CLI inside Jenkins container..."
+    if ! docker exec jenkins bash -c "command -v docker" &>/dev/null; then
+        info "Installing Docker CLI binary inside Jenkins container..."
+        docker exec -u root jenkins bash -c "apt-get update -qq && apt-get install -y -qq curl"
+        docker exec -u root jenkins bash -c "
+            curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+                | tar -xz --strip-components=1 -C /usr/local/bin docker/docker && \
+            chmod +x /usr/local/bin/docker
+        "
+        push_rollback "docker exec -u root jenkins rm -f /usr/local/bin/docker"
+        ok "Docker CLI installed in Jenkins."
+    else
+        ok "Docker CLI already installed in Jenkins."
+    fi
+
+    info "Checking Docker Compose v2 plugin inside Jenkins container..."
+    if ! docker exec jenkins bash -c "docker compose version" &>/dev/null; then
+        info "Installing Docker Compose v2 plugin inside Jenkins container..."
+        docker exec -u root jenkins bash -c "
+            mkdir -p /usr/local/lib/docker/cli-plugins && \
+            curl -fsSL https://github.com/docker/compose/releases/download/v${DOCKER_COMPOSE_VERSION}/docker-compose-linux-x86_64 \
+                -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+            chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+        "
+        push_rollback "docker exec -u root jenkins rm -f /usr/local/lib/docker/cli-plugins/docker-compose"
+        ok "Docker Compose v2 plugin installed in Jenkins."
+    else
+        ok "Docker Compose v2 already available in Jenkins."
+    fi
+
+    info "Configuring Jenkins workspace permissions..."
+    docker exec -u root jenkins bash -c "
+        echo 'umask 002' > /etc/profile.d/jenkins-umask.sh && \
+        chmod +x /etc/profile.d/jenkins-umask.sh
+    "
+    sudo chown -R 1000:1000 "$vol_path/workspace" 2>/dev/null || true
+    sudo chmod -R u+rwX "$vol_path/workspace" 2>/dev/null || true
+    push_rollback "docker exec -u root jenkins rm -f /etc/profile.d/jenkins-umask.sh"
+    ok "Jenkins workspace permissions configured."
+}
+
+# ============================================================================
+# 5. SSH Server
+# ============================================================================
+configure_ssh_server() {
+    info "Checking SSH daemon (sshd)..."
+    if ! command -v sshd &>/dev/null; then
+        warn "openssh-server not found. Installing..."
+        pkg_update
+        pkg_install openssh-server
+        push_rollback "pkg_remove openssh-server"
+    else
+        ok "openssh-server already installed."
+    fi
+
+    local sshd_svc
+    sshd_svc=$(svc_name_sshd)
+
+    if ! sudo systemctl is-enabled "$sshd_svc" &>/dev/null || ! sudo systemctl is-active --quiet "$sshd_svc"; then
+        svc_enable "$sshd_svc"
+        push_rollback "svc_disable $sshd_svc"
+    fi
+
+    if ss -tlnp | grep -q ':22'; then
+        ok "SSH daemon is listening on port 22."
+    else
+        err "SSH daemon is not listening on port 22 after start attempt."
+        exit 1
+    fi
+
+    mkdir -p "$HOME/.ssh"
+    touch "$HOME/.ssh/authorized_keys"
+    chmod 700 "$HOME/.ssh"
+    chmod 600 "$HOME/.ssh/authorized_keys"
+    ok "~/.ssh/authorized_keys is ready."
+
+    firewall_allow_port 22/tcp
+}
+
+# ============================================================================
+# 6. Cloudflare Tunnel
 # ============================================================================
 configure_cloudflare_tunnel() {
     info "Configuring Cloudflare Tunnel..."
@@ -288,14 +449,40 @@ EOF
 main() {
     prompt_config
     prep_system
+    deploy_stack
+    configure_pipeline_deps
+    configure_ssh_server
     configure_cloudflare_tunnel
 
     trap - ERR INT TERM
 
-    ok "Base infrastructure ready."
+    ok "Infrastructure is up!"
     echo "======================================================"
-    echo "Docker is installed and the infra network is created."
-    echo "Cloudflare Tunnel is configured."
+    local jenkins_vol
+    jenkins_vol=$(docker inspect jenkins \
+        --format '{{range .Mounts}}{{if eq .Destination "/var/jenkins_home"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || echo "")
+    if [ -n "$jenkins_vol" ] && sudo test -f "${jenkins_vol}/secrets/initialAdminPassword"; then
+        echo "Jenkins Admin Password:"
+        sudo cat "${jenkins_vol}/secrets/initialAdminPassword"
+    else
+        echo "Jenkins Admin Password: (already configured — check Jenkins UI)"
+    fi
+    echo "======================================================"
+    echo "Public SSH Key (Add to GitHub):"
+    cat ~/.ssh/id_ed25519.pub
+    echo "======================================================"
+    echo "Cloudflare Tunnel Config : $CF_CONFIG_DIR/config.yml"
+    echo "Tunnel Status            : sudo systemctl status cloudflared"
+    echo "Uptime Kuma              : http://localhost:3001"
+    echo "Watchtower               : auto-update daily at 04:00"
+    if [ -n "${USER_DOMAIN:-}" ]; then
+    echo "SSH Tunnel               : ssh.${USER_DOMAIN}"
+    fi
+    echo "======================================================"
+    echo "!!!  DEFAULT CREDENTIALS — CHANGE IMMEDIATELY  !!!"
+    echo "  Nginx Proxy Manager : admin@example.com / changeme"
+    echo "  Portainer           : set admin password on first login"
+    echo "  Jenkins             : see admin password above"
     echo "======================================================"
 }
 
