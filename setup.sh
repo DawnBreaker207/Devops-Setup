@@ -384,10 +384,10 @@ cleanup_all() {
     docker network rm "$NET" 2>/dev/null || true
     docker volume rm portainer_data uptime_kuma_data 2>/dev/null || true
 
-    if [ "$mode" = "full" ]; then
-        sudo systemctl stop cloudflared 2>/dev/null || true
-        sudo cloudflared service uninstall 2>/dev/null || true
+    sudo systemctl stop cloudflared 2>/dev/null || true
+    sudo cloudflared service uninstall 2>/dev/null || true
 
+    if [ "$mode" = "full" ]; then
         local existing_tunnel
         existing_tunnel=$(grep '^tunnel:' "$CF_CONFIG_DIR/config.yml" 2>/dev/null | awk '{print $2}' || true)
         if [ -n "$existing_tunnel" ]; then
@@ -396,8 +396,17 @@ cleanup_all() {
 
         rm -rf "$CF_CONFIG_DIR"
         sudo rm -f /etc/cloudflared/config.yml
+
+        pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
+        remove_cloudflared 2>/dev/null || true
+        pkg_remove openssh-server 2>/dev/null || true
+
+        firewall_deny_port 9443/tcp
+        firewall_deny_port 3001/tcp
+
+        sudo chmod 660 /var/run/docker.sock 2>/dev/null || true
+        sudo systemctl disable --now docker 2>/dev/null || true
     else
-        sudo systemctl stop cloudflared 2>/dev/null || true
         sudo rm -f /etc/cloudflared/config.yml
         rm -f "$CF_CONFIG_DIR/config.yml"
     fi
