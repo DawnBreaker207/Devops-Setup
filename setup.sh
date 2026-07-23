@@ -377,27 +377,32 @@ EOF
 # Cleanup / Overwrite
 # ============================================================================
 cleanup_all() {
-    warn "Cleaning up all infrastructure..."
+    local mode="${1:-full}"
+    warn "Cleaning up all infrastructure (mode: $mode)..."
 
     docker rm -f portainer uptime-kuma watchtower 2>/dev/null || true
-
     docker network rm "$NET" 2>/dev/null || true
-
     docker volume rm portainer_data uptime_kuma_data 2>/dev/null || true
 
-    sudo systemctl stop cloudflared 2>/dev/null || true
-    sudo cloudflared service uninstall 2>/dev/null || true
+    if [ "$mode" = "full" ]; then
+        sudo systemctl stop cloudflared 2>/dev/null || true
+        sudo cloudflared service uninstall 2>/dev/null || true
 
-    local existing_tunnel
-    existing_tunnel=$(grep '^tunnel:' "$CF_CONFIG_DIR/config.yml" 2>/dev/null | awk '{print $2}' || true)
-    if [ -n "$existing_tunnel" ]; then
-        cloudflared tunnel delete "$existing_tunnel" 2>/dev/null || true
+        local existing_tunnel
+        existing_tunnel=$(grep '^tunnel:' "$CF_CONFIG_DIR/config.yml" 2>/dev/null | awk '{print $2}' || true)
+        if [ -n "$existing_tunnel" ]; then
+            cloudflared tunnel delete "$existing_tunnel" 2>/dev/null || true
+        fi
+
+        rm -rf "$CF_CONFIG_DIR"
+        sudo rm -f /etc/cloudflared/config.yml
+    else
+        sudo systemctl stop cloudflared 2>/dev/null || true
+        sudo rm -f /etc/cloudflared/config.yml
+        rm -f "$CF_CONFIG_DIR/config.yml"
     fi
 
-    rm -rf "$CF_CONFIG_DIR"
-    sudo rm -f /etc/cloudflared/config.yml
-
-    ok "Cleanup complete."
+    ok "Cleanup complete (mode: $mode)."
 }
 
 # ============================================================================
@@ -405,13 +410,13 @@ cleanup_all() {
 # ============================================================================
 main() {
     if [ "${1:-}" = "--cleanup" ]; then
-        cleanup_all
+        cleanup_all full
         trap - ERR INT TERM
         exit 0
     fi
 
     if [ "${1:-}" = "--overwrite" ]; then
-        cleanup_all
+        cleanup_all overwrite
         echo ""
         info "Proceeding with fresh setup..."
     fi
