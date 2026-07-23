@@ -140,7 +140,6 @@ prep_system() {
         pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
         sudo systemctl enable --now docker
         sudo usermod -aG docker "$USER"
-        sudo chmod 666 /var/run/docker.sock
         push_rollback "pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
     else
         ok "Docker already installed."
@@ -158,6 +157,10 @@ prep_system() {
     fi
     DOCKER_SOCKET_GID=$(stat -c '%g' /var/run/docker.sock)
     ok "Docker socket group GID: $DOCKER_SOCKET_GID"
+
+    if ! docker info &>/dev/null; then
+        sudo chmod 666 /var/run/docker.sock
+    fi
 
     if ! docker network inspect "$NET" >/dev/null 2>&1; then
         docker network create "$NET"
