@@ -138,6 +138,7 @@ prep_system() {
             sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
         fi
         pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        sudo rm -f /var/run/docker.sock
         sudo systemctl daemon-reload
         sudo systemctl enable --now docker
         sudo usermod -aG docker "$USER"
@@ -398,6 +399,9 @@ cleanup_all() {
         rm -rf "$CF_CONFIG_DIR"
         sudo rm -f /etc/cloudflared/config.yml
 
+        sudo systemctl disable --now docker docker.socket 2>/dev/null || true
+        sudo rm -f /var/run/docker.sock
+
         pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
         remove_cloudflared 2>/dev/null || true
         pkg_remove openssh-server 2>/dev/null || true
@@ -405,8 +409,7 @@ cleanup_all() {
         firewall_deny_port 9443/tcp
         firewall_deny_port 3001/tcp
 
-        sudo chmod 660 /var/run/docker.sock 2>/dev/null || true
-        sudo systemctl disable --now docker 2>/dev/null || true
+        sudo systemctl daemon-reload 2>/dev/null || true
     else
         sudo rm -f /etc/cloudflared/config.yml
         rm -f "$CF_CONFIG_DIR/config.yml"
