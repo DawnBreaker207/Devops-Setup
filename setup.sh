@@ -4,7 +4,7 @@ set -euo pipefail
 NET="infra_network"
 CF_CONFIG_DIR="$HOME/.cloudflared"
 
-CLOUDFLARED_VERSION="2025.2.0"
+CLOUDFLARED_VERSION="2026.7.3"
 DOCKER_COMPOSE_VERSION="2.32.1"
 PORTAINER_VERSION="2.27.3"
 UPTIME_KUMA_VERSION="1.23.16"
@@ -31,7 +31,6 @@ install_cloudflared() {
     local version="$1"
     local arch
     arch=$(uname -m)
-    [[ "$arch" == "x86_64" ]] && arch="amd64" || arch="arm64"
     curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm
     sudo rpm -i /tmp/cloudflared.rpm && rm -f /tmp/cloudflared.rpm
 }
@@ -134,9 +133,12 @@ prep_system() {
     info "Checking Docker..."
     if ! command -v docker &> /dev/null; then
         warn "Docker not found. Installing..."
-        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-        sh /tmp/get-docker.sh
-        rm -f /tmp/get-docker.sh
+        if ! sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo 2>/dev/null; then
+            sudo dnf install -y dnf-plugins-core
+            sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+        fi
+        pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        sudo systemctl enable --now docker
         sudo usermod -aG docker "$USER"
         push_rollback "pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
     else
