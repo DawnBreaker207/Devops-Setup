@@ -158,7 +158,7 @@ prep_system() {
     DOCKER_SOCKET_GID=$(stat -c '%g' /var/run/docker.sock)
     ok "Docker socket group GID: $DOCKER_SOCKET_GID"
 
-    if ! docker info &>/dev/null; then
+    if ! id -nG | grep -qw docker; then
         sudo chmod 666 /var/run/docker.sock
     fi
 
