@@ -107,11 +107,16 @@ prompt_config() {
     read -r SSH_USER < /dev/tty
     SSH_USER="${SSH_USER:-$USER}"
 
+    ask "Expose SSH port 22 directly? (not recommended if using Cloudflare Tunnel) (y/n)"
+    read -r EXPOSE_SSH < /dev/tty
+    EXPOSE_SSH="${EXPOSE_SSH:-y}"
+
     echo "----------------------------------------------"
     echo "  GitHub Email : $GITHUB_EMAIL"
     echo "  Tunnel Name  : $CF_TUNNEL_NAME"
     echo "  Domain       : ${USER_DOMAIN:-"(skipped)"}"
     echo "  SSH User     : $SSH_USER"
+    echo "  Expose SSH   : $EXPOSE_SSH"
     echo "----------------------------------------------"
     ask "Confirm? (y/n)"
     read -r CONFIRM < /dev/tty
@@ -157,6 +162,15 @@ prep_system() {
     else
         ok "Network '$NET' already exists."
     fi
+
+    info "Checking Docker Compose plugin..."
+    if ! docker compose version &> /dev/null; then
+        warn "docker-compose-plugin not found. Installing..."
+        pkg_install "docker-compose-plugin-${DOCKER_COMPOSE_VERSION}"
+        push_rollback "pkg_remove docker-compose-plugin"
+    else
+        ok "Docker Compose plugin already installed."
+    fi
 }
 
 # ============================================================================
@@ -171,7 +185,8 @@ launch_container() {
         return
     fi
 
-    docker run -d --name "$name" --restart always --network "$NET" $args
+    local -a extra_args=($args)
+    docker run -d --name "$name" --restart always --network "$NET" "${extra_args[@]}"
     push_rollback "docker rm -f '$name'"
 }
 
@@ -179,14 +194,16 @@ launch_container() {
 # 3. Container Orchestration
 # ============================================================================
 deploy_stack() {
+    selinux_apply_context /var/run/docker.sock
+
     info "Deploying Portainer..."
-    launch_container "portainer" "-p 8000:8000 -p 9443:9443 --group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:${PORTAINER_VERSION}"
+    launch_container "portainer" "-p 8000:8000 -p 9443:9443 --group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data -l com.centurylinklogs.watchtower=true portainer/portainer-ce:${PORTAINER_VERSION}"
 
     info "Deploying Uptime Kuma..."
-    launch_container "uptime-kuma" "-p 3001:3001 --group-add ${DOCKER_SOCKET_GID} -v uptime_kuma_data:/app/data -v /var/run/docker.sock:/var/run/docker.sock louislam/uptime-kuma:${UPTIME_KUMA_VERSION}"
+    launch_container "uptime-kuma" "-p 3001:3001 --group-add ${DOCKER_SOCKET_GID} -v uptime_kuma_data:/app/data -v /var/run/docker.sock:/var/run/docker.sock -l com.centurylinklogs.watchtower=true louislam/uptime-kuma:${UPTIME_KUMA_VERSION}"
 
     info "Deploying Watchtower..."
-    launch_container "watchtower" "--group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:${WATCHTOWER_VERSION} --schedule \"0 0 4 * * *\" --cleanup"
+    launch_container "watchtower" "--group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:${WATCHTOWER_VERSION} --schedule \"0 0 4 * * *\" --cleanup --label-enable"
 
     firewall_allow_port 9443/tcp
     firewall_allow_port 3001/tcp
@@ -227,7 +244,9 @@ configure_ssh_server() {
     chmod 600 "$HOME/.ssh/authorized_keys"
     ok "~/.ssh/authorized_keys is ready."
 
-    firewall_allow_port 22/tcp
+    if [ "$EXPOSE_SSH" = "y" ] || [ "$EXPOSE_SSH" = "Y" ] || [ -z "${USER_DOMAIN:-}" ]; then
+        firewall_allow_port 22/tcp
+    fi
 }
 
 # ============================================================================
