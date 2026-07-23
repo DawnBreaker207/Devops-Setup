@@ -138,6 +138,7 @@ prep_system() {
             sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
         fi
         pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        sudo systemctl daemon-reload
         sudo systemctl enable --now docker
         sudo usermod -aG docker "$USER"
         push_rollback "pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
