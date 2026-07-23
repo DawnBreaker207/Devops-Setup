@@ -140,6 +140,7 @@ prep_system() {
         pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
         sudo systemctl enable --now docker
         sudo usermod -aG docker "$USER"
+        sudo chmod 666 /var/run/docker.sock
         push_rollback "pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
     else
         ok "Docker already installed."
