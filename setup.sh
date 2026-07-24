@@ -502,6 +502,7 @@ cleanup_all() {
         sudo systemctl daemon-reload 2>/dev/null || true
     else
         sudo rm -f /etc/cloudflared/config.yml
+        sudo rm -f /etc/systemd/system/cloudflared.service
         sudo rm -f /etc/systemd/system/cloudflared.service.d/override.conf
         rm -f "$CF_CONFIG_DIR/config.yml"
     fi
