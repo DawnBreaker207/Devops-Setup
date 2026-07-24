@@ -123,6 +123,49 @@ The setup script opens necessary ports via `firewalld`:
 
 All changes are persistent across reboots. Port `9000` (webhook) is not exposed — accessed only via Cloudflare Tunnel.
 
-## 7. Note
+## 7. Service Management
+
+### Stop / Start an individual service
+
+```bash
+docker stop <container_name>
+docker start <container_name>
+```
+
+Container names: `portainer`, `uptime-kuma`, `watchtower`, `deploy-webhook`.
+
+### Restart tunnel after config change
+
+```bash
+sudo systemctl restart cloudflared
+```
+
+### View logs
+
+```bash
+docker logs deploy-webhook
+docker logs watchtower
+sudo journalctl -u cloudflared
+```
+
+## 8. Cleanup / Re-deploy
+
+### Full uninstall (`--cleanup`)
+
+Removes all containers, volumes, Docker packages, cloudflared, firewall rules, and webhook files. SSH daemon is **not** removed.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash -s -- --cleanup
+```
+
+### Re-deploy preserving tunnel credentials (`--overwrite`)
+
+Removes containers and config, but preserves cloudflared `cert.pem` and tunnel credentials — no headless re-login needed.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash -s -- --overwrite
+```
+
+## 9. Note
 
 This is the **rocky** branch. For Ubuntu, use the `ubuntu` branch instead.
