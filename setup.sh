@@ -290,8 +290,32 @@ launch_deploy_webhook() {
 }
 
 sync_deploy() {
-    [ ! -f "$HOME/.deploy-env" ] && { err "No config found at $HOME/.deploy-env. Run full setup first."; exit 1; }
-    source "$HOME/.deploy-env"
+    if [ -f "$HOME/.deploy-env" ]; then
+        source "$HOME/.deploy-env"
+    else
+        warn "No .deploy-env found — extracting config from running state..."
+
+        DEPLOY_WEBHOOK_TOKEN=$(grep -oP '"value":\s*"\K[^"]+' "$HOME/deploy-hook/hooks.json" 2>/dev/null || true)
+        [ -z "$DEPLOY_WEBHOOK_TOKEN" ] && { err "Cannot read token from $HOME/deploy-hook/hooks.json"; exit 1; }
+
+        APP_DIR=$(docker inspect deploy-webhook \
+            --format '{{range .HostConfig.Binds}}{{.}}|{{end}}' 2>/dev/null | \
+            tr '|' '\n' | grep -v '/var/run/docker.sock' | grep -v '/deploy-hook' | \
+            sed 's/:.*//' | head -1)
+        APP_DIR="${APP_DIR:-/opt/myapp}"
+
+        USER_DOMAIN=$(grep 'hostname:' /etc/cloudflared/config.yml 2>/dev/null | head -1 | sed 's/.*hostname: //' | sed 's/^[^.]*\.//' || true)
+        CF_TUNNEL_NAME=$(grep '^tunnel:' "$HOME/.cloudflared/config.yml" 2>/dev/null | awk '{print $2}' || echo "")
+
+        cat > "$HOME/.deploy-env" <<EOF
+APP_DIR="${APP_DIR}"
+DEPLOY_WEBHOOK_TOKEN="${DEPLOY_WEBHOOK_TOKEN}"
+USER_DOMAIN="${USER_DOMAIN}"
+CF_TUNNEL_NAME="${CF_TUNNEL_NAME}"
+EXPOSE_SSH="${EXPOSE_SSH:-n}"
+EOF
+    fi
+
     info "Syncing deploy webhook..."
     docker rm -f deploy-webhook 2>/dev/null || true
     launch_deploy_webhook
