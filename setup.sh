@@ -122,6 +122,10 @@ prompt_config() {
     read -r EXPOSE_SSH < /dev/tty
     EXPOSE_SSH="${EXPOSE_SSH:-n}"
 
+    ask "App deploy directory (default: /opt/myapp)"
+    read -r APP_DIR < /dev/tty
+    APP_DIR="${APP_DIR:-/opt/myapp}"
+
     DEPLOY_WEBHOOK_TOKEN="$(openssl rand -hex 24)"
 
     echo "----------------------------------------------"
@@ -130,6 +134,7 @@ prompt_config() {
     echo "  Domain       : ${USER_DOMAIN:-"(skipped)"}"
     echo "  SSH User     : $SSH_USER"
     echo "  Expose SSH   : $EXPOSE_SSH"
+    echo "  App Dir      : $APP_DIR"
     echo "----------------------------------------------"
     ask "Confirm? (Y/n)"
     read -r CONFIRM < /dev/tty
@@ -220,22 +225,23 @@ write_deploy_webhook_files() {
     local hook_dir="$HOME/deploy-hook"
     mkdir -p "$hook_dir"
 
-    cat > "$hook_dir/deploy.sh" <<'SHEOF'
+    cat > "$hook_dir/deploy.sh" <<SHEOF
 #!/bin/sh
 set -e
-IMAGE_TAG="$1"
-if [ -z "$IMAGE_TAG" ]; then
+IMAGE_TAG="\$1"
+if [ -z "\$IMAGE_TAG" ]; then
     echo "ERROR: image_tag is required"
     exit 1
 fi
-APP_DIR="${APP_DIR:-/opt/myapp}"
-cd "$APP_DIR"
-echo "Deploying image tag: $IMAGE_TAG"
+APP_DIR="${APP_DIR}"
+mkdir -p "\$APP_DIR"
+cd "\$APP_DIR"
+echo "Deploying image tag: \$IMAGE_TAG"
 export IMAGE_TAG
 docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 docker image prune -f
-echo "Deploy complete: $IMAGE_TAG"
+echo "Deploy complete: \$IMAGE_TAG"
 SHEOF
     chmod +x "$hook_dir/deploy.sh"
 
