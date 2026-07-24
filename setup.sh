@@ -110,12 +110,17 @@ prompt_config() {
     read -r EXPOSE_SSH < /dev/tty
     EXPOSE_SSH="${EXPOSE_SSH:-y}"
 
+    ask "Deploy Webhook Token (leave blank to auto-generate)"
+    read -r DEPLOY_WEBHOOK_TOKEN < /dev/tty
+    DEPLOY_WEBHOOK_TOKEN="${DEPLOY_WEBHOOK_TOKEN:-$(openssl rand -hex 24)}"
+
     echo "----------------------------------------------"
     echo "  GitHub Email : $GITHUB_EMAIL"
     echo "  Tunnel Name  : $CF_TUNNEL_NAME"
     echo "  Domain       : ${USER_DOMAIN:-"(skipped)"}"
     echo "  SSH User     : $SSH_USER"
     echo "  Expose SSH   : $EXPOSE_SSH"
+    echo "  Webhook Token: (hidden, will be shown at the end)"
     echo "----------------------------------------------"
     ask "Confirm? (y/n)"
     read -r CONFIRM < /dev/tty
@@ -201,6 +206,58 @@ launch_container() {
 # ============================================================================
 # 3. Container Orchestration
 # ============================================================================
+write_deploy_webhook_files() {
+    local hook_dir="$HOME/deploy-hook"
+    mkdir -p "$hook_dir"
+
+    cat > "$hook_dir/deploy.sh" <<'SHEOF'
+#!/bin/bash
+set -e
+IMAGE_TAG="$1"
+if [ -z "$IMAGE_TAG" ]; then
+    echo "ERROR: image_tag is required"
+    exit 1
+fi
+APP_DIR="${APP_DIR:-/opt/myapp}"
+cd "$APP_DIR"
+echo "Deploying image tag: $IMAGE_TAG"
+export IMAGE_TAG
+docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+docker image prune -f
+echo "Deploy complete: $IMAGE_TAG"
+SHEOF
+    chmod +x "$hook_dir/deploy.sh"
+
+    cat > "$hook_dir/hooks.json" <<EOF
+[
+    {
+        "id": "deploy",
+        "execute-command": "/opt/deploy-hook/deploy.sh",
+        "command-working-directory": "/opt",
+        "pass-arguments-to-command": [
+            {
+                "source": "payload",
+                "name": "image_tag"
+            }
+        ],
+        "trigger-rule": {
+            "match": {
+                "type": "value",
+                "value": "${DEPLOY_WEBHOOK_TOKEN}",
+                "parameter": {
+                    "source": "header",
+                    "name": "X-Deploy-Token"
+                }
+            }
+        }
+    }
+]
+EOF
+
+    push_rollback "rm -rf '$hook_dir'"
+}
+
 deploy_stack() {
     selinux_apply_context /var/run/docker.sock
 
@@ -212,6 +269,10 @@ deploy_stack() {
 
     info "Deploying Watchtower..."
     launch_container "watchtower" "--group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:${WATCHTOWER_VERSION} --schedule \"0 0 4 * * *\" --cleanup --label-enable"
+
+    info "Deploying Deploy Webhook..."
+    write_deploy_webhook_files
+    launch_container "deploy-webhook" "-p 127.0.0.1:9000:9000 --group-add ${DOCKER_SOCKET_GID} -v $HOME/deploy-hook/hooks.json:/etc/webhook/hooks.json -v $HOME/deploy-hook/deploy.sh:/opt/deploy-hook/deploy.sh -v /var/run/docker.sock:/var/run/docker.sock -v /opt:/opt -l com.centurylinklogs.watchtower=true almir/webhook -hooks=/etc/webhook/hooks.json -verbose -port=9000"
 
     firewall_allow_port 9443/tcp
     firewall_allow_port 3001/tcp
@@ -323,6 +384,8 @@ ingress:
     service: http://localhost:3001
   - hostname: ssh.${USER_DOMAIN}
     service: ssh://localhost:22
+  - hostname: deploy.${USER_DOMAIN}
+    service: http://localhost:9000
   - service: http_status:404
 EOF
             ok "Tunnel config written with domain: $USER_DOMAIN (includes SSH ingress)"
@@ -349,6 +412,16 @@ EOF
         else
             ok "SSH ingress rule already present in config."
         fi
+
+        if [ -n "${USER_DOMAIN:-}" ] && ! grep -q "deploy.${USER_DOMAIN}" "$CONFIG_FILE"; then
+            warn "Existing config missing deploy ingress — patching..."
+            local ESCAPED_DOMAIN
+            ESCAPED_DOMAIN=$(printf '%s' "$USER_DOMAIN" | sed 's/\./\\./g')
+            sed -i "s|  - service: http_status:404|  - hostname: deploy.${ESCAPED_DOMAIN}\n    service: http://localhost:9000\n  - service: http_status:404|" "$CONFIG_FILE"
+            ok "Deploy ingress rule patched into existing config."
+        else
+            ok "Deploy ingress rule already present in config."
+        fi
     fi
 
     if [ -n "${USER_DOMAIN:-}" ]; then
@@ -357,6 +430,13 @@ EOF
             ok "DNS record created: ssh.${USER_DOMAIN}"
         else
             warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME ssh.${USER_DOMAIN}"
+        fi
+
+        info "Registering DNS CNAME for deploy.${USER_DOMAIN}..."
+        if cloudflared tunnel route dns "$CF_TUNNEL_NAME" "deploy.${USER_DOMAIN}" 2>/dev/null; then
+            ok "DNS record created: deploy.${USER_DOMAIN}"
+        else
+            warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME deploy.${USER_DOMAIN}"
         fi
     fi
 
@@ -382,7 +462,7 @@ cleanup_all() {
     local mode="${1:-full}"
     warn "Cleaning up all infrastructure (mode: $mode)..."
 
-    docker rm -f portainer uptime-kuma watchtower 2>/dev/null || true
+    docker rm -f portainer uptime-kuma watchtower deploy-webhook 2>/dev/null || true
     docker network rm "$NET" 2>/dev/null || true
     docker volume rm portainer_data uptime_kuma_data 2>/dev/null || true
 
@@ -403,6 +483,7 @@ cleanup_all() {
         sudo rm -f /var/run/docker.sock
 
         pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
+        rm -rf "$HOME/deploy-hook"
         remove_cloudflared 2>/dev/null || true
         pkg_remove openssh-server 2>/dev/null || true
 
@@ -449,21 +530,29 @@ main() {
     echo "Portainer                : https://localhost:9443"
     echo "Uptime Kuma              : http://localhost:3001"
     echo "Watchtower               : auto-update daily at 04:00"
+    echo "Deploy Webhook           : http://localhost:9000"
     if [ -n "${USER_DOMAIN:-}" ]; then
     echo "SSH Tunnel               : ssh.${USER_DOMAIN}"
     echo "Portainer                : https://portainer.${USER_DOMAIN}"
     echo "Uptime Kuma              : https://uptime.${USER_DOMAIN}"
+    echo "Deploy Webhook           : https://deploy.${USER_DOMAIN}"
     fi
     echo "======================================================"
     echo "!!!  DEFAULT CREDENTIALS — CHANGE IMMEDIATELY  !!!"
     echo "  Portainer : set admin password on first login"
     echo "======================================================"
     echo ""
-    echo "Next step: add a GitHub Actions deploy key"
-    echo "  1. ssh-keygen -t ed25519 -C 'github-actions'"
-    echo "  2. cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys"
-    echo "  3. Add private key to GitHub repo Secrets as SSH_KEY"
-    echo "  4. Create .github/workflows/deploy.yml in your app repo"
+    if [ -n "${USER_DOMAIN:-}" ]; then
+    echo "Next step: connect GitHub Actions via deploy webhook"
+    echo "  1. Webhook endpoint : https://deploy.${USER_DOMAIN}/hooks/deploy"
+    echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
+    echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
+    else
+    echo "Next step: connect GitHub Actions via deploy webhook"
+    echo "  1. Webhook endpoint : http://$(curl -s ifconfig.me):9000/hooks/deploy"
+    echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
+    echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
+    fi
     echo "======================================================"
 }
 
