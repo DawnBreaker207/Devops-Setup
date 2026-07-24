@@ -9,60 +9,64 @@ curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/se
 ```
 
 The script will prompt for:
-- **GitHub Email** — used to generate SSH key for GitHub Actions
+- **GitHub Email** — used for SSH key generation hint
 - **Cloudflare Tunnel Name** — choose any name, default is `infra-tunnel`
 - **Domain** — if provided, ingress will be auto-generated. Leave blank to skip
+- **SSH Username** — default is current user
+- **Only SSH via Cloudflare Tunnel?** — default `y` (no direct port 22, tunnel-only)
+- **Deploy Webhook Token** — auto-generated if left blank
 
 ## 2. Services
 
-| Service             | URL                    |
-| ------------------- | ---------------------- |
-| Portainer           | https://localhost:9443 |
-| Uptime Kuma         | http://localhost:3001  |
+| Service             | URL                      |
+| ------------------- | ------------------------ |
+| Portainer           | https://localhost:9443   |
+| Uptime Kuma         | http://localhost:3001    |
+| Deploy Webhook      | http://localhost:9000    |
 
 If a domain is provided, services are accessible via Cloudflare Tunnel:
 - `portainer.<YOUR_DOMAIN>`
 - `uptime.<YOUR_DOMAIN>`
+- `deploy.<YOUR_DOMAIN>`
 
-Watchtower auto-updates all containers daily at 04:00.
+Watchtower auto-updates all labeled containers daily at 04:00 (fallback). Deploy Webhook provides on-demand triggers from CI/CD.
 
-## 3. CI/CD with GitHub Actions
+## 3. CI/CD with GitHub Actions (Webhook)
 
-This branch uses **GitHub Actions** instead of Jenkins. After setup completes:
+Deploy via HTTP POST instead of SSH — no public SSH port needed.
 
-```bash
-# Create a deploy key
-ssh-keygen -t ed25519 -C "github-actions"
-cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
-```
+### Setup
 
-Add the private key to your GitHub repo: **Settings → Secrets and variables → Actions → New secret** named `SSH_KEY`.
+1. Add **repository secret** `DEPLOY_WEBHOOK_TOKEN` with the token printed at setup end
+2. Add **repository variable** `DEPLOY_DOMAIN` = `deploy.<YOUR_DOMAIN>`
 
-Create `.github/workflows/deploy.yml` in your app repo:
+### Workflow
+
+In your app repo's `.github/workflows/deploy.yml`:
 
 ```yaml
-name: Deploy
-on: [push]
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USER }}
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            cd /path/to/project
-            git pull
-            docker compose up -d --build
+- name: Deploy via webhook
+  run: |
+    curl -sf -X POST "https://deploy.${{ vars.DEPLOY_DOMAIN }}/hooks/deploy" \
+      -H "X-Deploy-Token: ${{ secrets.DEPLOY_WEBHOOK_TOKEN }}" \
+      -H "Content-Type: application/json" \
+      -d "{\"image_tag\": \"${{ steps.tag.outputs.tag }}\"}"
 ```
 
-View build logs on GitHub → **Actions** tab → click the workflow run.
+The webhook runs `deploy.sh` on the server which executes `docker compose pull && up -d` with the specified tag.
+
+### Manual test
+
+```bash
+curl -X POST https://deploy.<YOUR_DOMAIN>/hooks/deploy \
+  -H "X-Deploy-Token: <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"image_tag": "v1.0.0"}'
+```
 
 ## 4. Remote SSH Access (Client Setup)
 
-SSH into the server from any machine via Cloudflare Tunnel.
+SSH into the server from any machine via Cloudflare Tunnel ingress (`ssh.<YOUR_DOMAIN>` → `ssh://localhost:22`).
 
 ### Step 1 — Verify DNS record
 
@@ -76,61 +80,22 @@ Must show a CNAME to `*.cfargotunnel.com`. If missing:
 cloudflared tunnel route dns <TUNNEL_NAME> ssh.<YOUR_DOMAIN>
 ```
 
-### Step 2 — Install `cloudflared` on the client
-
-**Linux (Rocky/RHEL)**
-```bash
-curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-x86_64.rpm -o /tmp/cloudflared.rpm
-sudo rpm -i /tmp/cloudflared.rpm
-```
-
-**macOS**
-```bash
-brew install cloudflare/cloudflare/cloudflared
-```
-
-**Windows** — download from [releases](https://github.com/cloudflare/cloudflared/releases/latest)
-
-### Step 3 — Generate SSH key on client
+### Step 2 — Generate SSH key on your local machine
 
 ```bash
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
 ssh-keygen -t ed25519 -C "your@email.com"
-```
-
-### Step 4 — Add public key to server
-
-```bash
 cat ~/.ssh/id_ed25519.pub
 ```
 
-Copy output, then on the **server**:
+Copy the output and add it to the server's `~/.ssh/authorized_keys` (via VPS console or initial access).
+
+### Step 3 — Connect via tunnel
 
 ```bash
-echo "paste_your_public_key_here" >> ~/.ssh/authorized_keys
+ssh <SSH_USER>@ssh.<YOUR_DOMAIN>
 ```
 
-### Step 5 — Configure SSH on client
-
-```bash
-nano ~/.ssh/config
-```
-
-```ssh-config
-Host ssh.<YOUR_DOMAIN>
-  HostName ssh.<YOUR_DOMAIN>
-  User <SSH_USER>
-  IdentityFile ~/.ssh/id_ed25519
-  ProxyCommand cloudflared access ssh --hostname %h
-```
-
-**Windows** — use full path to `cloudflared.exe` in `ProxyCommand`.
-
-### Step 6 — Connect
-
-```bash
-ssh ssh.<YOUR_DOMAIN>
-```
+No `cloudflared` client installation needed — Cloudflare Tunnel handles the connection transparently as long as the ingress rule `ssh://localhost:22` is active.
 
 ### Troubleshooting
 
@@ -151,7 +116,12 @@ sudo chcon -Rt container_file_t /path/to/bind/mount
 
 ## 6. Firewall
 
-The setup script opens necessary ports via `firewalld`. All changes are persistent across reboots.
+The setup script opens necessary ports via `firewalld`:
+- `9443/tcp` — Portainer
+- `3001/tcp` — Uptime Kuma
+- `22/tcp` — only if SSH port exposure is enabled during setup
+
+All changes are persistent across reboots. Port `9000` (webhook) is not exposed — accessed only via Cloudflare Tunnel.
 
 ## 7. Note
 
