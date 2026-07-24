@@ -144,6 +144,16 @@ prompt_config() {
         trap - ERR INT TERM
         exit 1
     fi
+
+    cat > "$HOME/.deploy-env" <<EOF
+APP_DIR="${APP_DIR}"
+DEPLOY_WEBHOOK_TOKEN="${DEPLOY_WEBHOOK_TOKEN}"
+USER_DOMAIN="${USER_DOMAIN}"
+CF_TUNNEL_NAME="${CF_TUNNEL_NAME}"
+EXPOSE_SSH="${EXPOSE_SSH}"
+GITHUB_EMAIL="${GITHUB_EMAIL}"
+SSH_USER="${SSH_USER}"
+EOF
 }
 
 # ============================================================================
@@ -274,6 +284,20 @@ EOF
     push_rollback "rm -rf '$hook_dir'"
 }
 
+launch_deploy_webhook() {
+    write_deploy_webhook_files
+    launch_container "deploy-webhook" "-p 127.0.0.1:9000:9000 --group-add ${DOCKER_SOCKET_GID} -v $HOME/deploy-hook/hooks.json:/etc/webhook/hooks.json -v $HOME/deploy-hook/deploy.sh:/opt/deploy-hook/deploy.sh -v /var/run/docker.sock:/var/run/docker.sock -v ${APP_DIR}:${APP_DIR} -l com.centurylinklogs.watchtower=true almir/webhook -hooks=/etc/webhook/hooks.json -verbose -port=9000"
+}
+
+sync_deploy() {
+    [ ! -f "$HOME/.deploy-env" ] && { err "No config found at $HOME/.deploy-env. Run full setup first."; exit 1; }
+    source "$HOME/.deploy-env"
+    info "Syncing deploy webhook..."
+    docker rm -f deploy-webhook 2>/dev/null || true
+    launch_deploy_webhook
+    ok "Deploy webhook synced (APP_DIR=$APP_DIR)."
+}
+
 deploy_stack() {
     selinux_apply_context /var/run/docker.sock
 
@@ -288,8 +312,7 @@ deploy_stack() {
 
     if [ "$EXPOSE_SSH" = "n" ]; then
         info "Deploying Deploy Webhook..."
-        write_deploy_webhook_files
-        launch_container "deploy-webhook" "-p 127.0.0.1:9000:9000 --group-add ${DOCKER_SOCKET_GID} -v $HOME/deploy-hook/hooks.json:/etc/webhook/hooks.json -v $HOME/deploy-hook/deploy.sh:/opt/deploy-hook/deploy.sh -v /var/run/docker.sock:/var/run/docker.sock -v /opt:/opt -l com.centurylinklogs.watchtower=true almir/webhook -hooks=/etc/webhook/hooks.json -verbose -port=9000"
+        launch_deploy_webhook
     fi
 
     firewall_allow_port 9443/tcp
@@ -522,6 +545,7 @@ cleanup_all() {
         pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
         rm -rf "$HOME/deploy-hook"
         remove_cloudflared 2>/dev/null || true
+        rm -f "$HOME/.deploy-env"
         firewall_deny_port 9443/tcp
         firewall_deny_port 3001/tcp
 
@@ -553,6 +577,12 @@ main() {
         cleanup_all overwrite
         echo ""
         info "Proceeding with fresh setup..."
+    fi
+
+    if [ "${1:-}" = "--sync" ]; then
+        sync_deploy
+        trap - ERR INT TERM
+        exit 0
     fi
 
     prompt_config
