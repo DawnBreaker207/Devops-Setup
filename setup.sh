@@ -32,7 +32,7 @@ install_cloudflared() {
     local arch
     arch=$(uname -m)
     curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm
-    sudo rpm -i /tmp/cloudflared.rpm && rm -f /tmp/cloudflared.rpm
+    sudo rpm -U /tmp/cloudflared.rpm && rm -f /tmp/cloudflared.rpm
 }
 
 remove_cloudflared()         { sudo dnf remove -y cloudflared 2>/dev/null || true; }
@@ -449,11 +449,8 @@ EOF
     sudo cp "$CF_CONFIG_DIR/config.yml" /etc/cloudflared/config.yml
 
     sudo mkdir -p /etc/systemd/system/cloudflared.service.d
-    local OVERRIDE="/etc/systemd/system/cloudflared.service.d/override.conf"
-    if [ ! -f "$OVERRIDE" ]; then
-        printf '[Service]\nTimeoutStartSec=180\n' | sudo tee "$OVERRIDE" >/dev/null
-        sudo systemctl daemon-reload
-    fi
+    printf '[Service]\nTimeoutStartSec=180\n' | sudo tee /etc/systemd/system/cloudflared.service.d/override.conf >/dev/null
+    sudo systemctl daemon-reload
 
     if sudo test -f /etc/systemd/system/cloudflared.service; then
         ok "cloudflared service already installed — reloading config..."
@@ -504,6 +501,7 @@ cleanup_all() {
         sudo systemctl daemon-reload 2>/dev/null || true
     else
         sudo rm -f /etc/cloudflared/config.yml
+        sudo rm -f /etc/systemd/system/cloudflared.service.d/override.conf
         rm -f "$CF_CONFIG_DIR/config.yml"
     fi
 
