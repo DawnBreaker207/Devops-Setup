@@ -32,7 +32,7 @@ install_cloudflared() {
     local arch
     arch=$(uname -m)
     curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm
-    sudo rpm -U /tmp/cloudflared.rpm && rm -f /tmp/cloudflared.rpm
+    sudo rpm -U /tmp/cloudflared.rpm 2>/dev/null && rm -f /tmp/cloudflared.rpm
 }
 
 remove_cloudflared()         { sudo dnf remove -y cloudflared 2>/dev/null || true; }
@@ -119,8 +119,9 @@ prompt_config() {
     echo "  SSH User     : $SSH_USER"
     echo "  Expose SSH   : $EXPOSE_SSH"
     echo "----------------------------------------------"
-    ask "Confirm? (y/n)"
+    ask "Confirm? (Y/n)"
     read -r CONFIRM < /dev/tty
+    CONFIRM="${CONFIRM:-y}"
     if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
         echo "Aborted."
         trap - ERR INT TERM
