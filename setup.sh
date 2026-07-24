@@ -239,11 +239,20 @@ write_deploy_webhook_files() {
 #!/bin/sh
 set -e
 IMAGE_TAG="\$1"
+REPO_URL="\$2"
 if [ -z "\$IMAGE_TAG" ]; then
     echo "ERROR: image_tag is required"
     exit 1
 fi
 APP_DIR="${APP_DIR}"
+if [ -n "\$REPO_URL" ]; then
+    if [ -d "\$APP_DIR/.git" ]; then
+        cd "\$APP_DIR" && git pull
+    else
+        git clone "\$REPO_URL" "\$APP_DIR"
+        cd "\$APP_DIR"
+    fi
+fi
 mkdir -p "\$APP_DIR"
 cd "\$APP_DIR"
 echo "Deploying image tag: \$IMAGE_TAG"
@@ -265,6 +274,10 @@ SHEOF
             {
                 "source": "payload",
                 "name": "image_tag"
+            },
+            {
+                "source": "payload",
+                "name": "repo"
             }
         ],
         "trigger-rule": {
