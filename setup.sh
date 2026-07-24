@@ -317,6 +317,7 @@ EOF
     fi
 
     info "Syncing deploy webhook..."
+    DOCKER_SOCKET_GID=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 0)
     docker rm -f deploy-webhook 2>/dev/null || true
     launch_deploy_webhook
     ok "Deploy webhook synced (APP_DIR=$APP_DIR)."
