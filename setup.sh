@@ -106,7 +106,7 @@ prompt_config() {
     read -r SSH_USER < /dev/tty
     SSH_USER="${SSH_USER:-$USER}"
 
-    ask "Expose SSH port 22 directly? (not recommended if using Cloudflare Tunnel) (y/n)"
+    ask "Only SSH via Cloudflare Tunnel? (y/n, default: y)"
     read -r EXPOSE_SSH < /dev/tty
     EXPOSE_SSH="${EXPOSE_SSH:-y}"
 
@@ -313,7 +313,7 @@ configure_ssh_server() {
     chmod 600 "$HOME/.ssh/authorized_keys"
     ok "~/.ssh/authorized_keys is ready."
 
-    if [ "$EXPOSE_SSH" = "y" ] || [ "$EXPOSE_SSH" = "Y" ] || [ -z "${USER_DOMAIN:-}" ]; then
+    if [ "$EXPOSE_SSH" = "n" ] || [ "$EXPOSE_SSH" = "N" ]; then
         firewall_allow_port 22/tcp
     fi
 }
@@ -443,12 +443,20 @@ EOF
     sudo mkdir -p /etc/cloudflared
     sudo cp "$CF_CONFIG_DIR/config.yml" /etc/cloudflared/config.yml
 
+    sudo mkdir -p /etc/systemd/system/cloudflared.service.d
+    local OVERRIDE="/etc/systemd/system/cloudflared.service.d/override.conf"
+    if [ ! -f "$OVERRIDE" ]; then
+        printf '[Service]\nTimeoutStartSec=180\n' | sudo tee "$OVERRIDE" >/dev/null
+        sudo systemctl daemon-reload
+    fi
+
     if sudo test -f /etc/systemd/system/cloudflared.service; then
         ok "cloudflared service already installed — reloading config..."
         sudo systemctl restart cloudflared
     else
         info "Installing cloudflared as a system service..."
         sudo cloudflared service install
+        sudo systemctl daemon-reload
         sudo systemctl enable cloudflared
         sudo systemctl start cloudflared
         push_rollback "sudo cloudflared service uninstall; sudo rm -f /etc/cloudflared/config.yml"
@@ -485,8 +493,6 @@ cleanup_all() {
         pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
         rm -rf "$HOME/deploy-hook"
         remove_cloudflared 2>/dev/null || true
-        pkg_remove openssh-server 2>/dev/null || true
-
         firewall_deny_port 9443/tcp
         firewall_deny_port 3001/tcp
 
