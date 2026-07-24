@@ -29,10 +29,18 @@ svc_restart()   { sudo systemctl restart "$1"; }
 
 install_cloudflared() {
     local version="$1"
+    if command -v cloudflared &>/dev/null; then
+        ok "cloudflared already installed. Skipping download."
+        return
+    fi
     local arch
     arch=$(uname -m)
-    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm
-    sudo rpm -U /tmp/cloudflared.rpm 2>/dev/null && rm -f /tmp/cloudflared.rpm
+    info "Downloading cloudflared ${version} (${arch})..."
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm || {
+        err "Failed to download cloudflared RPM."
+        exit 1
+    }
+    sudo rpm -U /tmp/cloudflared.rpm && rm -f /tmp/cloudflared.rpm
 }
 
 remove_cloudflared()         { sudo dnf remove -y cloudflared 2>/dev/null || true; }
@@ -503,7 +511,10 @@ cleanup_all() {
     else
         sudo rm -f /etc/cloudflared/config.yml
         sudo rm -f /etc/systemd/system/cloudflared.service
+        sudo rm -f /etc/systemd/system/multi-user.target.wants/cloudflared.service
+        sudo rm -f /usr/lib/systemd/system/cloudflared.service
         sudo rm -f /etc/systemd/system/cloudflared.service.d/override.conf
+        sudo systemctl daemon-reload
         rm -f "$CF_CONFIG_DIR/config.yml"
     fi
 
