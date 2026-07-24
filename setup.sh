@@ -31,16 +31,20 @@ install_cloudflared() {
     local version="$1"
     if command -v cloudflared &>/dev/null; then
         ok "cloudflared already installed. Skipping download."
-        return
+        return 0
     fi
     local arch
     arch=$(uname -m)
     info "Downloading cloudflared ${version} (${arch})..."
-    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm || {
-        err "Failed to download cloudflared RPM."
-        exit 1
+    if ! curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm; then
+        err "Failed to download cloudflared RPM. Check Internet or GitHub access."
+        return 1
+    fi
+    sudo rpm -U /tmp/cloudflared.rpm || {
+        err "Failed to install cloudflared RPM."
+        return 1
     }
-    sudo rpm -U /tmp/cloudflared.rpm && rm -f /tmp/cloudflared.rpm
+    rm -f /tmp/cloudflared.rpm
 }
 
 remove_cloudflared()         { sudo dnf remove -y cloudflared 2>/dev/null || true; }
@@ -331,14 +335,22 @@ configure_ssh_server() {
 # ============================================================================
 configure_cloudflare_tunnel() {
     info "Configuring Cloudflare Tunnel..."
-    install_cloudflared "$CLOUDFLARED_VERSION"
+    install_cloudflared "$CLOUDFLARED_VERSION" || {
+        err "install_cloudflared failed. Check network connectivity and GitHub access."
+        rollback_all
+    }
+    ok "cloudflared binary ready."
     push_rollback "remove_cloudflared"
 
     mkdir -p "$CF_CONFIG_DIR"
 
     if [ ! -f "$CF_CONFIG_DIR/cert.pem" ]; then
-        info "Logging in to Cloudflare (browser will open)..."
-        cloudflared tunnel login
+        info "Cloudflare login required."
+        info "If running headless, visit the URL below in your browser:"
+        cloudflared tunnel login || {
+            err "cloudflared tunnel login failed."
+            rollback_all
+        }
         push_rollback "rm -f '$CF_CONFIG_DIR/cert.pem'"
     else
         ok "Cloudflare cert already exists. Skipping login."
