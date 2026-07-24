@@ -13,8 +13,10 @@ The script will prompt for:
 - **Cloudflare Tunnel Name** — choose any name, default is `infra-tunnel`
 - **Domain** — if provided, ingress will be auto-generated. Leave blank to skip
 - **SSH Username** — default is current user
-- **Only SSH via Cloudflare Tunnel?** — default `y` (no direct port 22, tunnel-only)
-- **Deploy Webhook Token** — auto-generated if left blank
+- **Only SSH via Cloudflare Tunnel?** — default `n` (also exposes port 22)
+- **App deploy directory** — default `/opt/myapp` (where your docker-compose files live)
+
+Configuration is saved to `~/.deploy-env` for later sync operations.
 
 ## 2. Services
 
@@ -30,6 +32,8 @@ If a domain is provided, services are accessible via Cloudflare Tunnel:
 - `deploy.<YOUR_DOMAIN>`
 
 Watchtower auto-updates all labeled containers daily at 04:00 (fallback). Deploy Webhook provides on-demand triggers from CI/CD.
+
+The webhook container mounts `$APP_DIR` (chosen during setup) so `deploy.sh` can access your `docker-compose.yml` and `docker-compose.prod.yml`. Place these files in the app directory after setup.
 
 ## 3. CI/CD with GitHub Actions (Webhook)
 
@@ -148,11 +152,19 @@ docker logs watchtower
 sudo journalctl -u cloudflared
 ```
 
-## 8. Cleanup / Re-deploy
+## 8. Sync / Cleanup / Re-deploy
+
+### Sync deploy hook after script update (`--sync`)
+
+Regenerates `hooks.json` and `deploy.sh` from the latest `setup.sh`, then restarts the `deploy-webhook` container. Preserves all existing config from `~/.deploy-env` — no prompts, no tunnel restart.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash -s -- --sync
+```
 
 ### Full uninstall (`--cleanup`)
 
-Removes all containers, volumes, Docker packages, cloudflared, firewall rules, and webhook files. SSH daemon is **not** removed.
+Removes all containers, volumes, Docker packages, cloudflared, firewall rules, webhook files, and `~/.deploy-env`. SSH daemon is **not** removed.
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash -s -- --cleanup
