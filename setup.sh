@@ -286,7 +286,13 @@ EOF
 
 launch_deploy_webhook() {
     write_deploy_webhook_files
-    launch_container "deploy-webhook" "-p 127.0.0.1:9000:9000 --group-add ${DOCKER_SOCKET_GID} -v $HOME/deploy-hook/hooks.json:/etc/webhook/hooks.json -v $HOME/deploy-hook/deploy.sh:/opt/deploy-hook/deploy.sh -v /var/run/docker.sock:/var/run/docker.sock -v ${APP_DIR}:${APP_DIR} -l com.centurylinklogs.watchtower=true almir/webhook -hooks=/etc/webhook/hooks.json -verbose -port=9000"
+    local docker_cli_plugins=""
+    for p in /usr/libexec/docker/cli-plugins /usr/local/lib/docker/cli-plugins; do
+        if [ -f "$p/docker-compose" ]; then
+            docker_cli_plugins="$docker_cli_plugins -v $p/docker-compose:$p/docker-compose"
+        fi
+    done
+    launch_container "deploy-webhook" "-p 127.0.0.1:9000:9000 --group-add ${DOCKER_SOCKET_GID} -v $HOME/deploy-hook/hooks.json:/etc/webhook/hooks.json -v $HOME/deploy-hook/deploy.sh:/opt/deploy-hook/deploy.sh -v /var/run/docker.sock:/var/run/docker.sock -v /usr/bin/docker:/usr/bin/docker${docker_cli_plugins} -v ${APP_DIR}:${APP_DIR} -l com.centurylinklogs.watchtower=true almir/webhook -hooks=/etc/webhook/hooks.json -verbose -port=9000"
 }
 
 sync_deploy() {
