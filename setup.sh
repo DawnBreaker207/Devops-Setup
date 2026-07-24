@@ -221,7 +221,7 @@ write_deploy_webhook_files() {
     mkdir -p "$hook_dir"
 
     cat > "$hook_dir/deploy.sh" <<'SHEOF'
-#!/bin/bash
+#!/bin/sh
 set -e
 IMAGE_TAG="$1"
 if [ -z "$IMAGE_TAG" ]; then
