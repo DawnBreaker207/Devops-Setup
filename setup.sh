@@ -549,17 +549,25 @@ main() {
     echo "======================================================"
     echo ""
     if [ -n "${USER_DOMAIN:-}" ]; then
-    echo "Next step: connect GitHub Actions via deploy webhook"
-    echo "  1. Webhook endpoint : https://deploy.${USER_DOMAIN}/hooks/deploy"
-    echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
-    echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
-    else
-    echo "Next step: connect GitHub Actions via deploy webhook"
-    echo "  1. Webhook endpoint : http://$(curl -s ifconfig.me):9000/hooks/deploy"
-    echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
-    echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
-    fi
-    echo "======================================================"
+     echo "Next step: connect GitHub Actions via deploy webhook"
+     echo "  1. Webhook endpoint : https://deploy.${USER_DOMAIN}/hooks/deploy"
+     echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
+     echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
+     else
+     echo "Next step: connect GitHub Actions via deploy webhook"
+     echo "  1. Webhook endpoint : http://$(curl -s ifconfig.me):9000/hooks/deploy"
+     echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
+     echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
+     fi
+     echo ""
+     echo "SSH key for admin access (paste this into your local ~/.ssh/authorized_keys or GitHub SSH keys):"
+     if [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
+         echo "  $(cat $HOME/.ssh/id_ed25519.pub)"
+     else
+         echo "  (none found — generate one with: ssh-keygen -t ed25519 -C \"${GITHUB_EMAIL}\")"
+         echo "  Then show it: cat ~/.ssh/id_ed25519.pub"
+     fi
+     echo "======================================================"
 }
 
 { main "$@"; } < /dev/tty
