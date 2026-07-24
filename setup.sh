@@ -560,13 +560,10 @@ main() {
      echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
      fi
      echo ""
-     echo "SSH key for admin access (paste this into your local ~/.ssh/authorized_keys or GitHub SSH keys):"
-     if [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
-         echo "  $(cat $HOME/.ssh/id_ed25519.pub)"
-     else
-         echo "  (none found — generate one with: ssh-keygen -t ed25519 -C \"${GITHUB_EMAIL}\")"
-         echo "  Then show it: cat ~/.ssh/id_ed25519.pub"
-     fi
+     echo "SSH key setup (on your LOCAL machine):"
+     echo "  1. ssh-keygen -t ed25519 -C \"${GITHUB_EMAIL}\"   # if you don't have one yet"
+     echo "  2. cat ~/.ssh/id_ed25519.pub                     # copy the output"
+     echo "  3. Paste it into this server's ~/.ssh/authorized_keys"
      echo "======================================================"
 }
 
