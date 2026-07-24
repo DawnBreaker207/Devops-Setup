@@ -295,8 +295,8 @@ install_webhook_host() {
         webhook_url=$(curl -s https://api.github.com/repos/adnanh/webhook/releases/latest 2>/dev/null | grep -oP '"browser_download_url":.*?webhook-linux-amd64\.tar\.gz"' | sed 's/.*: "//;s/"//' || true)
         [ -z "$webhook_url" ] && webhook_url="https://github.com/adnanh/webhook/releases/latest/download/webhook-linux-amd64.tar.gz"
         curl -sL "$webhook_url" -o "$tmpdir/webhook.tar.gz"
-        tar xzf "$tmpdir/webhook.tar.gz" -C "$tmpdir" webhook 2>/dev/null || true
-        sudo mv "$tmpdir/webhook" /usr/local/bin/webhook 2>/dev/null || true
+        tar xzf "$tmpdir/webhook.tar.gz" -C "$tmpdir" --strip-components=1 webhook-linux-amd64/webhook
+        sudo install -m 755 "$tmpdir/webhook" /usr/local/bin/webhook
         rm -rf "$tmpdir"
     fi
 
