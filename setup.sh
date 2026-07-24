@@ -106,13 +106,11 @@ prompt_config() {
     read -r SSH_USER < /dev/tty
     SSH_USER="${SSH_USER:-$USER}"
 
-    ask "Only SSH via Cloudflare Tunnel? (y/n, default: y)"
+    ask "Only SSH via Cloudflare Tunnel? (y/n, default: n)"
     read -r EXPOSE_SSH < /dev/tty
-    EXPOSE_SSH="${EXPOSE_SSH:-y}"
+    EXPOSE_SSH="${EXPOSE_SSH:-n}"
 
-    ask "Deploy Webhook Token (leave blank to auto-generate)"
-    read -r DEPLOY_WEBHOOK_TOKEN < /dev/tty
-    DEPLOY_WEBHOOK_TOKEN="${DEPLOY_WEBHOOK_TOKEN:-$(openssl rand -hex 24)}"
+    DEPLOY_WEBHOOK_TOKEN="$(openssl rand -hex 24)"
 
     echo "----------------------------------------------"
     echo "  GitHub Email : $GITHUB_EMAIL"
@@ -120,7 +118,6 @@ prompt_config() {
     echo "  Domain       : ${USER_DOMAIN:-"(skipped)"}"
     echo "  SSH User     : $SSH_USER"
     echo "  Expose SSH   : $EXPOSE_SSH"
-    echo "  Webhook Token: (hidden, will be shown at the end)"
     echo "----------------------------------------------"
     ask "Confirm? (y/n)"
     read -r CONFIRM < /dev/tty
@@ -270,9 +267,11 @@ deploy_stack() {
     info "Deploying Watchtower..."
     launch_container "watchtower" "--group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:${WATCHTOWER_VERSION} --schedule \"0 0 4 * * *\" --cleanup --label-enable"
 
-    info "Deploying Deploy Webhook..."
-    write_deploy_webhook_files
-    launch_container "deploy-webhook" "-p 127.0.0.1:9000:9000 --group-add ${DOCKER_SOCKET_GID} -v $HOME/deploy-hook/hooks.json:/etc/webhook/hooks.json -v $HOME/deploy-hook/deploy.sh:/opt/deploy-hook/deploy.sh -v /var/run/docker.sock:/var/run/docker.sock -v /opt:/opt -l com.centurylinklogs.watchtower=true almir/webhook -hooks=/etc/webhook/hooks.json -verbose -port=9000"
+    if [ "$EXPOSE_SSH" = "n" ]; then
+        info "Deploying Deploy Webhook..."
+        write_deploy_webhook_files
+        launch_container "deploy-webhook" "-p 127.0.0.1:9000:9000 --group-add ${DOCKER_SOCKET_GID} -v $HOME/deploy-hook/hooks.json:/etc/webhook/hooks.json -v $HOME/deploy-hook/deploy.sh:/opt/deploy-hook/deploy.sh -v /var/run/docker.sock:/var/run/docker.sock -v /opt:/opt -l com.centurylinklogs.watchtower=true almir/webhook -hooks=/etc/webhook/hooks.json -verbose -port=9000"
+    fi
 
     firewall_allow_port 9443/tcp
     firewall_allow_port 3001/tcp
@@ -371,24 +370,26 @@ configure_cloudflare_tunnel() {
         info "Writing tunnel config to $CONFIG_FILE"
 
         if [ -n "${USER_DOMAIN:-}" ]; then
-            cat > "$CONFIG_FILE" <<EOF
-tunnel: ${TUNNEL_ID}
-credentials-file: ${CREDS_FILE}
-
-ingress:
-  - hostname: portainer.${USER_DOMAIN}
-    service: https://localhost:9443
-    originRequest:
-      noTLSVerify: true
-  - hostname: uptime.${USER_DOMAIN}
-    service: http://localhost:3001
-  - hostname: ssh.${USER_DOMAIN}
-    service: ssh://localhost:22
-  - hostname: deploy.${USER_DOMAIN}
-    service: http://localhost:9000
-  - service: http_status:404
-EOF
-            ok "Tunnel config written with domain: $USER_DOMAIN (includes SSH ingress)"
+            {
+                echo "tunnel: ${TUNNEL_ID}"
+                echo "credentials-file: ${CREDS_FILE}"
+                echo ""
+                echo "ingress:"
+                echo "  - hostname: portainer.${USER_DOMAIN}"
+                echo "    service: https://localhost:9443"
+                echo "    originRequest:"
+                echo "      noTLSVerify: true"
+                echo "  - hostname: uptime.${USER_DOMAIN}"
+                echo "    service: http://localhost:3001"
+                echo "  - hostname: ssh.${USER_DOMAIN}"
+                echo "    service: ssh://localhost:22"
+                if [ "$EXPOSE_SSH" = "n" ]; then
+                    echo "  - hostname: deploy.${USER_DOMAIN}"
+                    echo "    service: http://localhost:9000"
+                fi
+                echo "  - service: http_status:404"
+            } > "$CONFIG_FILE"
+            ok "Tunnel config written with domain: $USER_DOMAIN"
         else
             cat > "$CONFIG_FILE" <<EOF
 tunnel: ${TUNNEL_ID}
@@ -413,12 +414,14 @@ EOF
             ok "SSH ingress rule already present in config."
         fi
 
-        if [ -n "${USER_DOMAIN:-}" ] && ! grep -q "deploy.${USER_DOMAIN}" "$CONFIG_FILE"; then
+        if [ "$EXPOSE_SSH" = "n" ] && [ -n "${USER_DOMAIN:-}" ] && ! grep -q "deploy.${USER_DOMAIN}" "$CONFIG_FILE"; then
             warn "Existing config missing deploy ingress — patching..."
             local ESCAPED_DOMAIN
             ESCAPED_DOMAIN=$(printf '%s' "$USER_DOMAIN" | sed 's/\./\\./g')
             sed -i "s|  - service: http_status:404|  - hostname: deploy.${ESCAPED_DOMAIN}\n    service: http://localhost:9000\n  - service: http_status:404|" "$CONFIG_FILE"
             ok "Deploy ingress rule patched into existing config."
+        elif [ "$EXPOSE_SSH" != "n" ]; then
+            ok "Deploy ingress not needed (exposed SSH mode)."
         else
             ok "Deploy ingress rule already present in config."
         fi
@@ -432,11 +435,13 @@ EOF
             warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME ssh.${USER_DOMAIN}"
         fi
 
-        info "Registering DNS CNAME for deploy.${USER_DOMAIN}..."
-        if cloudflared tunnel route dns "$CF_TUNNEL_NAME" "deploy.${USER_DOMAIN}" 2>/dev/null; then
-            ok "DNS record created: deploy.${USER_DOMAIN}"
-        else
-            warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME deploy.${USER_DOMAIN}"
+        if [ "$EXPOSE_SSH" = "n" ]; then
+            info "Registering DNS CNAME for deploy.${USER_DOMAIN}..."
+            if cloudflared tunnel route dns "$CF_TUNNEL_NAME" "deploy.${USER_DOMAIN}" 2>/dev/null; then
+                ok "DNS record created: deploy.${USER_DOMAIN}"
+            else
+                warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME deploy.${USER_DOMAIN}"
+            fi
         fi
     fi
 
@@ -536,19 +541,24 @@ main() {
     echo "Portainer                : https://localhost:9443"
     echo "Uptime Kuma              : http://localhost:3001"
     echo "Watchtower               : auto-update daily at 04:00"
+    if [ "$EXPOSE_SSH" = "n" ]; then
     echo "Deploy Webhook           : http://localhost:9000"
+    fi
     if [ -n "${USER_DOMAIN:-}" ]; then
     echo "SSH Tunnel               : ssh.${USER_DOMAIN}"
     echo "Portainer                : https://portainer.${USER_DOMAIN}"
     echo "Uptime Kuma              : https://uptime.${USER_DOMAIN}"
+    if [ "$EXPOSE_SSH" = "n" ]; then
     echo "Deploy Webhook           : https://deploy.${USER_DOMAIN}"
+    fi
     fi
     echo "======================================================"
     echo "!!!  DEFAULT CREDENTIALS — CHANGE IMMEDIATELY  !!!"
     echo "  Portainer : set admin password on first login"
     echo "======================================================"
     echo ""
-    if [ -n "${USER_DOMAIN:-}" ]; then
+    if [ "$EXPOSE_SSH" = "n" ]; then
+     if [ -n "${USER_DOMAIN:-}" ]; then
      echo "Next step: connect GitHub Actions via deploy webhook"
      echo "  1. Webhook endpoint : https://deploy.${USER_DOMAIN}/hooks/deploy"
      echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
@@ -558,6 +568,7 @@ main() {
      echo "  1. Webhook endpoint : http://$(curl -s ifconfig.me):9000/hooks/deploy"
      echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
      echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
+     fi
      fi
      echo ""
      echo "SSH key setup (on your LOCAL machine):"
