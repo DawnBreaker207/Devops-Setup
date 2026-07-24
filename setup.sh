@@ -259,8 +259,8 @@ SHEOF
 [
     {
         "id": "deploy",
-        "execute-command": "/opt/deploy-hook/deploy.sh",
-        "command-working-directory": "/opt",
+        "execute-command": "$HOME/deploy-hook/deploy.sh",
+        "command-working-directory": "${APP_DIR}",
         "pass-arguments-to-command": [
             {
                 "source": "payload",
@@ -284,15 +284,41 @@ EOF
     push_rollback "rm -rf '$hook_dir'"
 }
 
-launch_deploy_webhook() {
+install_webhook_host() {
     write_deploy_webhook_files
-    local docker_cli_plugins=""
-    for p in /usr/libexec/docker/cli-plugins /usr/local/lib/docker/cli-plugins; do
-        if [ -f "$p/docker-compose" ]; then
-            docker_cli_plugins="$docker_cli_plugins -v $p/docker-compose:$p/docker-compose"
-        fi
-    done
-    launch_container "deploy-webhook" "-p 127.0.0.1:9000:9000 --group-add ${DOCKER_SOCKET_GID} -v $HOME/deploy-hook/hooks.json:/etc/webhook/hooks.json -v $HOME/deploy-hook/deploy.sh:/opt/deploy-hook/deploy.sh -v /var/run/docker.sock:/var/run/docker.sock -v /usr/bin/docker:/usr/bin/docker${docker_cli_plugins} -v ${APP_DIR}:${APP_DIR} -l com.centurylinklogs.watchtower=true almir/webhook -hooks=/etc/webhook/hooks.json -verbose -port=9000"
+
+    if ! command -v /usr/local/bin/webhook &>/dev/null; then
+        info "Downloading webhook binary..."
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        local webhook_url
+        webhook_url=$(curl -s https://api.github.com/repos/adnanh/webhook/releases/latest 2>/dev/null | grep -oP '"browser_download_url":.*?webhook-linux-amd64\.tar\.gz"' | sed 's/.*: "//;s/"//' || true)
+        [ -z "$webhook_url" ] && webhook_url="https://github.com/adnanh/webhook/releases/latest/download/webhook-linux-amd64.tar.gz"
+        curl -sL "$webhook_url" -o "$tmpdir/webhook.tar.gz"
+        tar xzf "$tmpdir/webhook.tar.gz" -C "$tmpdir" webhook 2>/dev/null || true
+        sudo mv "$tmpdir/webhook" /usr/local/bin/webhook 2>/dev/null || true
+        rm -rf "$tmpdir"
+    fi
+
+    sudo tee /etc/systemd/system/deploy-webhook.service >/dev/null <<EOF
+[Unit]
+Description=Deploy Webhook
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/webhook -hooks $HOME/deploy-hook/hooks.json -verbose -port=9000 -ip=127.0.0.1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable deploy-webhook
+    sudo systemctl restart deploy-webhook
+    push_rollback "sudo systemctl disable --now deploy-webhook; sudo rm -f /etc/systemd/system/deploy-webhook.service; sudo systemctl daemon-reload"
 }
 
 sync_deploy() {
@@ -304,11 +330,7 @@ sync_deploy() {
         DEPLOY_WEBHOOK_TOKEN=$(grep -oP '"value":\s*"\K[^"]+' "$HOME/deploy-hook/hooks.json" 2>/dev/null || true)
         [ -z "$DEPLOY_WEBHOOK_TOKEN" ] && { err "Cannot read token from $HOME/deploy-hook/hooks.json"; exit 1; }
 
-        APP_DIR=$(docker inspect deploy-webhook \
-            --format '{{range .HostConfig.Binds}}{{.}}|{{end}}' 2>/dev/null | \
-            tr '|' '\n' | grep -v '/var/run/docker.sock' | grep -v '/deploy-hook' | \
-            sed 's/:.*//' | head -1)
-        APP_DIR="${APP_DIR:-/opt/myapp}"
+        APP_DIR=$(grep '^APP_DIR=' "$HOME/deploy-hook/deploy.sh" 2>/dev/null | sed 's/.*APP_DIR="//;s/"$//' || echo "/opt/myapp")
 
         USER_DOMAIN=$(grep 'hostname:' /etc/cloudflared/config.yml 2>/dev/null | head -1 | sed 's/.*hostname: //' | sed 's/^[^.]*\.//' || true)
         CF_TUNNEL_NAME=$(grep '^tunnel:' "$HOME/.cloudflared/config.yml" 2>/dev/null | awk '{print $2}' || echo "")
@@ -323,9 +345,9 @@ EOF
     fi
 
     info "Syncing deploy webhook..."
-    DOCKER_SOCKET_GID=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 0)
-    docker rm -f deploy-webhook 2>/dev/null || true
-    launch_deploy_webhook
+    write_deploy_webhook_files
+    sudo systemctl daemon-reload 2>/dev/null || true
+    sudo systemctl restart deploy-webhook 2>/dev/null || install_webhook_host
     ok "Deploy webhook synced (APP_DIR=$APP_DIR)."
 }
 
@@ -342,8 +364,8 @@ deploy_stack() {
     launch_container "watchtower" "--group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:${WATCHTOWER_VERSION} --schedule \"0 0 4 * * *\" --cleanup --label-enable"
 
     if [ "$EXPOSE_SSH" = "n" ]; then
-        info "Deploying Deploy Webhook..."
-        launch_deploy_webhook
+        info "Installing Deploy Webhook..."
+        install_webhook_host
     fi
 
     firewall_allow_port 9443/tcp
@@ -554,6 +576,9 @@ cleanup_all() {
     warn "Cleaning up all infrastructure (mode: $mode)..."
 
     docker rm -f portainer uptime-kuma watchtower deploy-webhook 2>/dev/null || true
+    sudo systemctl disable --now deploy-webhook 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/deploy-webhook.service
+    sudo rm -f /usr/local/bin/webhook
     docker network rm "$NET" 2>/dev/null || true
     docker volume rm portainer_data uptime_kuma_data 2>/dev/null || true
 
