@@ -122,19 +122,12 @@ prompt_config() {
     read -r EXPOSE_SSH < /dev/tty
     EXPOSE_SSH="${EXPOSE_SSH:-n}"
 
-    ask "App deploy directory (default: /opt/myapp)"
-    read -r APP_DIR < /dev/tty
-    APP_DIR="${APP_DIR:-/opt/myapp}"
-
-    DEPLOY_WEBHOOK_TOKEN="$(openssl rand -hex 24)"
-
     echo "----------------------------------------------"
     echo "  GitHub Email : $GITHUB_EMAIL"
     echo "  Tunnel Name  : $CF_TUNNEL_NAME"
     echo "  Domain       : ${USER_DOMAIN:-"(skipped)"}"
     echo "  SSH User     : $SSH_USER"
     echo "  Expose SSH   : $EXPOSE_SSH"
-    echo "  App Dir      : $APP_DIR"
     echo "----------------------------------------------"
     ask "Confirm? (Y/n)"
     read -r CONFIRM < /dev/tty
@@ -144,16 +137,6 @@ prompt_config() {
         trap - ERR INT TERM
         exit 1
     fi
-
-    cat > "$HOME/.deploy-env" <<EOF
-APP_DIR="${APP_DIR}"
-DEPLOY_WEBHOOK_TOKEN="${DEPLOY_WEBHOOK_TOKEN}"
-USER_DOMAIN="${USER_DOMAIN}"
-CF_TUNNEL_NAME="${CF_TUNNEL_NAME}"
-EXPOSE_SSH="${EXPOSE_SSH}"
-GITHUB_EMAIL="${GITHUB_EMAIL}"
-SSH_USER="${SSH_USER}"
-EOF
 }
 
 # ============================================================================
@@ -231,139 +214,6 @@ launch_container() {
 # ============================================================================
 # 3. Container Orchestration
 # ============================================================================
-write_deploy_webhook_files() {
-    local hook_dir="$HOME/deploy-hook"
-    mkdir -p "$hook_dir"
-
-    cat > "$hook_dir/deploy.sh" <<SHEOF
-#!/bin/sh
-set -e
-IMAGE_TAG="\$1"
-REPO_URL="\$2"
-if [ -z "\$IMAGE_TAG" ]; then
-    echo "ERROR: image_tag is required"
-    exit 1
-fi
-APP_DIR="${APP_DIR}"
-if [ -n "\$REPO_URL" ]; then
-    if [ -d "\$APP_DIR/.git" ]; then
-        cd "\$APP_DIR" && git pull
-    else
-        git clone "\$REPO_URL" "\$APP_DIR"
-        cd "\$APP_DIR"
-    fi
-fi
-mkdir -p "\$APP_DIR"
-cd "\$APP_DIR"
-echo "Deploying image tag: \$IMAGE_TAG"
-export IMAGE_TAG
-docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-docker image prune -f
-echo "Deploy complete: \$IMAGE_TAG"
-SHEOF
-    chmod +x "$hook_dir/deploy.sh"
-
-    cat > "$hook_dir/hooks.json" <<EOF
-[
-    {
-        "id": "deploy",
-        "execute-command": "$HOME/deploy-hook/deploy.sh",
-        "command-working-directory": "${APP_DIR}",
-        "pass-arguments-to-command": [
-            {
-                "source": "payload",
-                "name": "image_tag"
-            },
-            {
-                "source": "payload",
-                "name": "repo"
-            }
-        ],
-        "trigger-rule": {
-            "match": {
-                "type": "value",
-                "value": "${DEPLOY_WEBHOOK_TOKEN}",
-                "parameter": {
-                    "source": "header",
-                    "name": "X-Deploy-Token"
-                }
-            }
-        }
-    }
-]
-EOF
-
-    push_rollback "rm -rf '$hook_dir'"
-}
-
-install_webhook_host() {
-    write_deploy_webhook_files
-
-    if ! command -v /usr/local/bin/webhook &>/dev/null; then
-        info "Downloading webhook binary..."
-        local tmpdir
-        tmpdir=$(mktemp -d)
-        local webhook_url
-        webhook_url=$(curl -s https://api.github.com/repos/adnanh/webhook/releases/latest 2>/dev/null | grep -oP '"browser_download_url":.*?webhook-linux-amd64\.tar\.gz"' | sed 's/.*: "//;s/"//' || true)
-        [ -z "$webhook_url" ] && webhook_url="https://github.com/adnanh/webhook/releases/latest/download/webhook-linux-amd64.tar.gz"
-        curl -sL "$webhook_url" -o "$tmpdir/webhook.tar.gz"
-        tar xzf "$tmpdir/webhook.tar.gz" -C "$tmpdir" --strip-components=1 webhook-linux-amd64/webhook
-        sudo install -m 755 "$tmpdir/webhook" /usr/local/bin/webhook
-        rm -rf "$tmpdir"
-    fi
-
-    sudo tee /etc/systemd/system/deploy-webhook.service >/dev/null <<EOF
-[Unit]
-Description=Deploy Webhook
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/webhook -hooks $HOME/deploy-hook/hooks.json -verbose -port=9000 -ip=127.0.0.1
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable deploy-webhook
-    sudo systemctl restart deploy-webhook
-    push_rollback "sudo systemctl disable --now deploy-webhook; sudo rm -f /etc/systemd/system/deploy-webhook.service; sudo systemctl daemon-reload"
-}
-
-sync_deploy() {
-    if [ -f "$HOME/.deploy-env" ]; then
-        source "$HOME/.deploy-env"
-    else
-        warn "No .deploy-env found — extracting config from running state..."
-
-        DEPLOY_WEBHOOK_TOKEN=$(grep -oP '"value":\s*"\K[^"]+' "$HOME/deploy-hook/hooks.json" 2>/dev/null || true)
-        [ -z "$DEPLOY_WEBHOOK_TOKEN" ] && { err "Cannot read token from $HOME/deploy-hook/hooks.json"; exit 1; }
-
-        APP_DIR=$(grep '^APP_DIR=' "$HOME/deploy-hook/deploy.sh" 2>/dev/null | sed 's/.*APP_DIR="//;s/"$//' || echo "/opt/myapp")
-
-        USER_DOMAIN=$(grep 'hostname:' /etc/cloudflared/config.yml 2>/dev/null | head -1 | sed 's/.*hostname: //' | sed 's/^[^.]*\.//' || true)
-        CF_TUNNEL_NAME=$(grep '^tunnel:' "$HOME/.cloudflared/config.yml" 2>/dev/null | awk '{print $2}' || echo "")
-
-        cat > "$HOME/.deploy-env" <<EOF
-APP_DIR="${APP_DIR}"
-DEPLOY_WEBHOOK_TOKEN="${DEPLOY_WEBHOOK_TOKEN}"
-USER_DOMAIN="${USER_DOMAIN}"
-CF_TUNNEL_NAME="${CF_TUNNEL_NAME}"
-EXPOSE_SSH="${EXPOSE_SSH:-n}"
-EOF
-    fi
-
-    info "Syncing deploy webhook..."
-    write_deploy_webhook_files
-    sudo systemctl daemon-reload 2>/dev/null || true
-    sudo systemctl restart deploy-webhook 2>/dev/null || install_webhook_host
-    ok "Deploy webhook synced (APP_DIR=$APP_DIR)."
-}
-
 deploy_stack() {
     selinux_apply_context /var/run/docker.sock
 
@@ -375,11 +225,6 @@ deploy_stack() {
 
     info "Deploying Watchtower..."
     launch_container "watchtower" "--group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:${WATCHTOWER_VERSION} --schedule \"0 0 4 * * *\" --cleanup --label-enable"
-
-    if [ "$EXPOSE_SSH" = "n" ]; then
-        info "Installing Deploy Webhook..."
-        install_webhook_host
-    fi
 
     firewall_allow_port 9443/tcp
     firewall_allow_port 3001/tcp
@@ -499,10 +344,6 @@ configure_cloudflare_tunnel() {
                 echo "    service: http://localhost:3001"
                 echo "  - hostname: ssh.${USER_DOMAIN}"
                 echo "    service: ssh://localhost:22"
-                if [ "$EXPOSE_SSH" = "n" ]; then
-                    echo "  - hostname: deploy.${USER_DOMAIN}"
-                    echo "    service: http://localhost:9000"
-                fi
                 echo "  - service: http_status:404"
             } > "$CONFIG_FILE"
             ok "Tunnel config written with domain: $USER_DOMAIN"
@@ -530,17 +371,7 @@ EOF
             ok "SSH ingress rule already present in config."
         fi
 
-        if [ "$EXPOSE_SSH" = "n" ] && [ -n "${USER_DOMAIN:-}" ] && ! grep -q "deploy.${USER_DOMAIN}" "$CONFIG_FILE"; then
-            warn "Existing config missing deploy ingress — patching..."
-            local ESCAPED_DOMAIN
-            ESCAPED_DOMAIN=$(printf '%s' "$USER_DOMAIN" | sed 's/\./\\./g')
-            sed -i "s|  - service: http_status:404|  - hostname: deploy.${ESCAPED_DOMAIN}\n    service: http://localhost:9000\n  - service: http_status:404|" "$CONFIG_FILE"
-            ok "Deploy ingress rule patched into existing config."
-        elif [ "$EXPOSE_SSH" != "n" ]; then
-            ok "Deploy ingress not needed (exposed SSH mode)."
-        else
-            ok "Deploy ingress rule already present in config."
-        fi
+
     fi
 
     if [ -n "${USER_DOMAIN:-}" ]; then
@@ -551,14 +382,6 @@ EOF
             warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME ssh.${USER_DOMAIN}"
         fi
 
-        if [ "$EXPOSE_SSH" = "n" ]; then
-            info "Registering DNS CNAME for deploy.${USER_DOMAIN}..."
-            if cloudflared tunnel route dns "$CF_TUNNEL_NAME" "deploy.${USER_DOMAIN}" 2>/dev/null; then
-                ok "DNS record created: deploy.${USER_DOMAIN}"
-            else
-                warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME deploy.${USER_DOMAIN}"
-            fi
-        fi
     fi
 
     sudo mkdir -p /etc/cloudflared
@@ -588,10 +411,7 @@ cleanup_all() {
     local mode="${1:-full}"
     warn "Cleaning up all infrastructure (mode: $mode)..."
 
-    docker rm -f portainer uptime-kuma watchtower deploy-webhook 2>/dev/null || true
-    sudo systemctl disable --now deploy-webhook 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/deploy-webhook.service
-    sudo rm -f /usr/local/bin/webhook
+    docker rm -f portainer uptime-kuma watchtower 2>/dev/null || true
     docker network rm "$NET" 2>/dev/null || true
     docker volume rm portainer_data uptime_kuma_data 2>/dev/null || true
 
@@ -612,9 +432,7 @@ cleanup_all() {
         sudo rm -f /var/run/docker.sock
 
         pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
-        rm -rf "$HOME/deploy-hook"
         remove_cloudflared 2>/dev/null || true
-        rm -f "$HOME/.deploy-env"
         firewall_deny_port 9443/tcp
         firewall_deny_port 3001/tcp
 
@@ -648,12 +466,6 @@ main() {
         info "Proceeding with fresh setup..."
     fi
 
-    if [ "${1:-}" = "--sync" ]; then
-        sync_deploy
-        trap - ERR INT TERM
-        exit 0
-    fi
-
     prompt_config
     prep_system
     deploy_stack
@@ -669,36 +481,16 @@ main() {
     echo "Portainer                : https://localhost:9443"
     echo "Uptime Kuma              : http://localhost:3001"
     echo "Watchtower               : auto-update daily at 04:00"
-    if [ "$EXPOSE_SSH" = "n" ]; then
-    echo "Deploy Webhook           : http://localhost:9000"
-    fi
     if [ -n "${USER_DOMAIN:-}" ]; then
     echo "SSH Tunnel               : ssh.${USER_DOMAIN}"
     echo "Portainer                : https://portainer.${USER_DOMAIN}"
     echo "Uptime Kuma              : https://uptime.${USER_DOMAIN}"
-    if [ "$EXPOSE_SSH" = "n" ]; then
-    echo "Deploy Webhook           : https://deploy.${USER_DOMAIN}"
-    fi
     fi
     echo "======================================================"
     echo "!!!  DEFAULT CREDENTIALS — CHANGE IMMEDIATELY  !!!"
     echo "  Portainer : set admin password on first login"
     echo "======================================================"
     echo ""
-    if [ "$EXPOSE_SSH" = "n" ]; then
-     if [ -n "${USER_DOMAIN:-}" ]; then
-     echo "Next step: connect GitHub Actions via deploy webhook"
-     echo "  1. Webhook endpoint : https://deploy.${USER_DOMAIN}/hooks/deploy"
-     echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
-     echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
-     else
-     echo "Next step: connect GitHub Actions via deploy webhook"
-     echo "  1. Webhook endpoint : http://$(curl -s ifconfig.me):9000/hooks/deploy"
-     echo "  2. Add GitHub repo secret DEPLOY_WEBHOOK_TOKEN = ${DEPLOY_WEBHOOK_TOKEN}"
-     echo "  3. Update deploy.yml: replace SSH step with curl POST (see project docs)"
-     fi
-     fi
-     echo ""
      echo "SSH key setup (on your LOCAL machine):"
      echo "  1. ssh-keygen -t ed25519 -C \"${GITHUB_EMAIL}\"   # if you don't have one yet"
      echo "  2. cat ~/.ssh/id_ed25519.pub                     # copy the output"
