@@ -1,20 +1,31 @@
 #!/bin/bash
 set -euo pipefail
 
-NET="infra_network"
-CF_CONFIG_DIR="$HOME/.cloudflared"
+readonly NET="infra_network"
+readonly CF_CONFIG_DIR="$HOME/.cloudflared"
 
-CLOUDFLARED_VERSION="2026.7.3"
-DOCKER_COMPOSE_VERSION="2.32.1"
-PORTAINER_VERSION="2.27.3"
-UPTIME_KUMA_VERSION="1.23.16"
-WATCHTOWER_VERSION="1.7.1"
+# Version pins — edit when needed (cloudflared/compose pre-checks fail fast on bad pins).
+readonly CLOUDFLARED_VERSION="2026.7.3"
+readonly DOCKER_COMPOSE_VERSION="2.32.1"
+readonly PORTAINER_VERSION="2.27.3"
+readonly UPTIME_KUMA_VERSION="1.23.16"
+readonly WATCHTOWER_VERSION="1.7.1"
+readonly SCRIPT_VERSION="1.0.0"
 
 info() { printf "%b[INFO]%b %s\n" "\e[34m" "\e[0m" "$1"; }
 ok()   { printf "%b[OK]%b   %s\n" "\e[32m" "\e[0m" "$1"; }
 warn() { printf "%b[WARN]%b %s\n" "\e[33m" "\e[0m" "$1"; }
 err()  { printf "%b[ERR]%b  %s\n" "\e[31m" "\e[0m" "$1"; }
 ask()  { printf "%b[INPUT]%b %s: " "\e[35m" "\e[0m" "$1" > /dev/tty; }
+
+# Run docker; fall back to `sg docker` if the session predates the group add.
+dockerx() {
+    if id -nG | grep -qw docker; then
+        docker "$@"
+    else
+        sg docker -c "$(printf '%q ' docker "$@")"
+    fi
+}
 
 # ============================================================================
 # Distro Contract — Rocky Linux (dnf-based)
@@ -37,7 +48,8 @@ install_cloudflared() {
     arch=$(uname -m)
     info "Downloading cloudflared ${version} (${arch})..."
     if ! curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm; then
-        err "Failed to download cloudflared RPM. Check Internet or GitHub access."
+        err "Failed to download cloudflared ${version} RPM — the pinned version may not exist."
+        err "Update CLOUDFLARED_VERSION in setup.sh to a valid release (github.com/cloudflare/cloudflared/releases)."
         return 1
     fi
     sudo rpm -U /tmp/cloudflared.rpm || {
@@ -78,7 +90,7 @@ push_rollback() {
 
 ROLLBACK_IN_PROGRESS=0
 rollback_all() {
-    if [ "$ROLLBACK_IN_PROGRESS" -eq 1 ]; then
+    if [[ "$ROLLBACK_IN_PROGRESS" -eq 1 ]]; then
         return 0
     fi
     ROLLBACK_IN_PROGRESS=1
@@ -97,15 +109,16 @@ rollback_all() {
 trap 'rollback_all' ERR INT TERM
 
 # ============================================================================
-# prompt_config
+# prompt_config() vars (per-site; feeds a future myserver.env):
+#   CF_TUNNEL_NAME  string  default: infra-tunnel
+#   USER_DOMAIN     string  default: "" (blank = skip ingress)
+#   SSH_USER        string  default: $USER
+#   EXPOSE_SSH      y|n     default: n (open firewall 22/tcp?)
 # ============================================================================
 prompt_config() {
     echo "=============================================="
     echo "         Infrastructure Setup Config"
     echo "=============================================="
-
-    ask "GitHub Email"
-    read -r GITHUB_EMAIL < /dev/tty
 
     ask "Cloudflare Tunnel Name (default: infra-tunnel)"
     read -r CF_TUNNEL_NAME < /dev/tty
@@ -118,12 +131,11 @@ prompt_config() {
     read -r SSH_USER < /dev/tty
     SSH_USER="${SSH_USER:-$USER}"
 
-    ask "Only SSH via Cloudflare Tunnel? (y/n, default: n)"
+    ask "Expose SSH port 22 directly to the internet? (y/n, default: n — tunnel-only)"
     read -r EXPOSE_SSH < /dev/tty
     EXPOSE_SSH="${EXPOSE_SSH:-n}"
 
     echo "----------------------------------------------"
-    echo "  GitHub Email : $GITHUB_EMAIL"
     echo "  Tunnel Name  : $CF_TUNNEL_NAME"
     echo "  Domain       : ${USER_DOMAIN:-"(skipped)"}"
     echo "  SSH User     : $SSH_USER"
@@ -162,11 +174,11 @@ prep_system() {
 
     info "Checking Docker socket..."
     local tries=0
-    while [ ! -S /var/run/docker.sock ] && [ $tries -lt 10 ]; do
+    while [[ ! -S /var/run/docker.sock ]] && [[ $tries -lt 10 ]]; do
         sleep 1
         tries=$((tries + 1))
     done
-    if [ ! -S /var/run/docker.sock ]; then
+    if [[ ! -S /var/run/docker.sock ]]; then
         err "Docker socket not found at /var/run/docker.sock after install."
         exit 1
     fi
@@ -174,19 +186,25 @@ prep_system() {
     ok "Docker socket group GID: $DOCKER_SOCKET_GID"
 
     if ! id -nG | grep -qw docker; then
-        sudo chmod 666 /var/run/docker.sock
+        info "Session predates the docker group add — docker calls will run via 'sg docker'."
     fi
 
-    if ! docker network inspect "$NET" >/dev/null 2>&1; then
-        docker network create "$NET"
-        push_rollback "docker network rm '$NET'"
+    if ! dockerx network inspect "$NET" >/dev/null 2>&1; then
+        dockerx network create "$NET"
+        push_rollback "dockerx network rm '$NET'"
     else
         ok "Network '$NET' already exists."
     fi
 
     info "Checking Docker Compose plugin..."
     if ! docker compose version &> /dev/null; then
-        warn "docker-compose-plugin not found. Installing..."
+        warn "docker-compose-plugin not found. Checking pinned version in dnf..."
+        if ! sudo dnf list --available "docker-compose-plugin-${DOCKER_COMPOSE_VERSION}*" 2>/dev/null | grep -q "docker-compose-plugin"; then
+            err "docker-compose-plugin-${DOCKER_COMPOSE_VERSION} not found in the dnf repos."
+            err "Update DOCKER_COMPOSE_VERSION in setup.sh to a version available via dnf."
+            trap - ERR INT TERM
+            exit 1
+        fi
         pkg_install "docker-compose-plugin-${DOCKER_COMPOSE_VERSION}"
         push_rollback "pkg_remove docker-compose-plugin"
     else
@@ -199,16 +217,15 @@ prep_system() {
 # ============================================================================
 launch_container() {
     local name=$1
-    local args=$2
+    shift
 
-    if [ "$(docker ps -aq -f name=^/${name}$)" ]; then
+    if [[ "$(dockerx ps -aq -f name=^/"$name"$)" ]]; then
         warn "Container '$name' already exists. Skipping."
         return
     fi
 
-    local -a extra_args=($args)
-    docker run -d --name "$name" --restart always --network "$NET" "${extra_args[@]}"
-    push_rollback "docker rm -f '$name'"
+    dockerx run -d --name "$name" --restart always --network "$NET" "$@"
+    push_rollback "dockerx rm -f '$name'"
 }
 
 # ============================================================================
@@ -218,16 +235,13 @@ deploy_stack() {
     selinux_apply_context /var/run/docker.sock
 
     info "Deploying Portainer..."
-    launch_container "portainer" "-p 8000:8000 -p 9443:9443 --group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data -l com.centurylinklogs.watchtower=true portainer/portainer-ce:${PORTAINER_VERSION}"
+    launch_container "portainer" -p 8000:8000 -p 9443:9443 --group-add "$DOCKER_SOCKET_GID" -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data -l com.centurylinklabs.watchtower.enable=true "portainer/portainer-ce:${PORTAINER_VERSION}"
 
     info "Deploying Uptime Kuma..."
-    launch_container "uptime-kuma" "-p 3001:3001 --group-add ${DOCKER_SOCKET_GID} -v uptime_kuma_data:/app/data -v /var/run/docker.sock:/var/run/docker.sock -l com.centurylinklogs.watchtower=true louislam/uptime-kuma:${UPTIME_KUMA_VERSION}"
+    launch_container "uptime-kuma" -p 3001:3001 --group-add "$DOCKER_SOCKET_GID" -v uptime_kuma_data:/app/data -v /var/run/docker.sock:/var/run/docker.sock -l com.centurylinklabs.watchtower.enable=true "louislam/uptime-kuma:${UPTIME_KUMA_VERSION}"
 
     info "Deploying Watchtower..."
-    launch_container "watchtower" "--group-add ${DOCKER_SOCKET_GID} -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower:${WATCHTOWER_VERSION} --schedule \"0 0 4 * * *\" --cleanup --label-enable"
-
-    firewall_allow_port 9443/tcp
-    firewall_allow_port 3001/tcp
+    launch_container "watchtower" --group-add "$DOCKER_SOCKET_GID" -v /var/run/docker.sock:/var/run/docker.sock "containrrr/watchtower:${WATCHTOWER_VERSION}" --schedule "0 0 4 * * *" --cleanup --label-enable
 }
 
 # ============================================================================
@@ -263,9 +277,9 @@ configure_ssh_server() {
     touch "$HOME/.ssh/authorized_keys"
     chmod 700 "$HOME/.ssh"
     chmod 600 "$HOME/.ssh/authorized_keys"
-    ok "~/.ssh/authorized_keys is ready."
+    ok "$HOME/.ssh/authorized_keys is ready."
 
-    if [ "$EXPOSE_SSH" = "n" ] || [ "$EXPOSE_SSH" = "N" ]; then
+    if [[ "$EXPOSE_SSH" = "y" ]] || [[ "$EXPOSE_SSH" = "Y" ]]; then
         firewall_allow_port 22/tcp
     fi
 }
@@ -284,7 +298,7 @@ configure_cloudflare_tunnel() {
 
     mkdir -p "$CF_CONFIG_DIR"
 
-    if [ ! -f "$CF_CONFIG_DIR/cert.pem" ]; then
+    if [[ ! -f "$CF_CONFIG_DIR/cert.pem" ]]; then
         info "Cloudflare login required."
         info "If running headless, visit the URL below in your browser:"
         cloudflared tunnel login || {
@@ -306,13 +320,13 @@ configure_cloudflare_tunnel() {
 
     local TUNNEL_ID
     TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | awk -v name="$CF_TUNNEL_NAME" '$2==name {print $1}')
-    if [ -z "$TUNNEL_ID" ]; then
+    if [[ -z "$TUNNEL_ID" ]]; then
         err "Cannot resolve tunnel ID for '$CF_TUNNEL_NAME'. Aborting."
         exit 1
     fi
 
     local CREDS_FILE="$CF_CONFIG_DIR/${TUNNEL_ID}.json"
-    if [ ! -f "$CREDS_FILE" ]; then
+    if [[ ! -f "$CREDS_FILE" ]]; then
         err "Credentials file not found: $CREDS_FILE"
         err "Tunnel may have been created under a different account or deleted."
         exit 1
@@ -320,17 +334,17 @@ configure_cloudflare_tunnel() {
 
     local CONFIG_FILE="$CF_CONFIG_DIR/config.yml"
     local EXISTING_ID=""
-    if [ -f "$CONFIG_FILE" ]; then
+    if [[ -f "$CONFIG_FILE" ]]; then
         EXISTING_ID=$(grep '^tunnel:' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' || true)
     fi
 
-    if [ ! -f "$CONFIG_FILE" ] || [ "$EXISTING_ID" != "$TUNNEL_ID" ]; then
-        if [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "$TUNNEL_ID" ]; then
+    if [[ ! -f "$CONFIG_FILE" ]] || [[ "$EXISTING_ID" != "$TUNNEL_ID" ]]; then
+        if [[ -n "$EXISTING_ID" ]] && [[ "$EXISTING_ID" != "$TUNNEL_ID" ]]; then
             warn "Config has stale tunnel ID '$EXISTING_ID', overwriting with '$TUNNEL_ID'..."
         fi
         info "Writing tunnel config to $CONFIG_FILE"
 
-        if [ -n "${USER_DOMAIN:-}" ]; then
+        if [[ -n "${USER_DOMAIN:-}" ]]; then
             {
                 echo "tunnel: ${TUNNEL_ID}"
                 echo "credentials-file: ${CREDS_FILE}"
@@ -361,7 +375,7 @@ EOF
     else
         ok "Tunnel config already exists and tunnel ID matches. Skipping."
 
-        if [ -n "${USER_DOMAIN:-}" ] && ! grep -q "ssh://localhost:22" "$CONFIG_FILE"; then
+        if [[ -n "${USER_DOMAIN:-}" ]] && ! grep -q "ssh://localhost:22" "$CONFIG_FILE"; then
             warn "Existing config missing SSH ingress — patching..."
             local ESCAPED_DOMAIN
             ESCAPED_DOMAIN=$(printf '%s' "$USER_DOMAIN" | sed 's/\./\\./g')
@@ -371,10 +385,9 @@ EOF
             ok "SSH ingress rule already present in config."
         fi
 
-
     fi
 
-    if [ -n "${USER_DOMAIN:-}" ]; then
+    if [[ -n "${USER_DOMAIN:-}" ]]; then
         info "Registering DNS CNAME for ssh.${USER_DOMAIN}..."
         if cloudflared tunnel route dns "$CF_TUNNEL_NAME" "ssh.${USER_DOMAIN}" 2>/dev/null; then
             ok "DNS record created: ssh.${USER_DOMAIN}"
@@ -418,10 +431,10 @@ cleanup_all() {
     sudo systemctl stop cloudflared 2>/dev/null || true
     sudo cloudflared service uninstall 2>/dev/null || true
 
-    if [ "$mode" = "full" ]; then
+    if [[ "$mode" = "full" ]]; then
         local existing_tunnel
         existing_tunnel=$(grep '^tunnel:' "$CF_CONFIG_DIR/config.yml" 2>/dev/null | awk '{print $2}' || true)
-        if [ -n "$existing_tunnel" ]; then
+        if [[ -n "$existing_tunnel" ]]; then
             cloudflared tunnel delete "$existing_tunnel" 2>/dev/null || true
         fi
 
@@ -454,13 +467,13 @@ cleanup_all() {
 # Main
 # ============================================================================
 main() {
-    if [ "${1:-}" = "--cleanup" ]; then
+    if [[ "${1:-}" = "--cleanup" ]]; then
         cleanup_all full
         trap - ERR INT TERM
         exit 0
     fi
 
-    if [ "${1:-}" = "--overwrite" ]; then
+    if [[ "${1:-}" = "--overwrite" ]]; then
         cleanup_all overwrite
         echo ""
         info "Proceeding with fresh setup..."
@@ -475,13 +488,14 @@ main() {
     trap - ERR INT TERM
 
     ok "Infrastructure is up!"
+    echo "Script version             : setup.sh v$SCRIPT_VERSION"
     echo "======================================================"
     echo "Cloudflare Tunnel Config : $CF_CONFIG_DIR/config.yml"
     echo "Tunnel Status            : sudo systemctl status cloudflared"
     echo "Portainer                : https://localhost:9443"
     echo "Uptime Kuma              : http://localhost:3001"
     echo "Watchtower               : auto-update daily at 04:00"
-    if [ -n "${USER_DOMAIN:-}" ]; then
+    if [[ -n "${USER_DOMAIN:-}" ]]; then
     echo "SSH Tunnel               : ssh.${USER_DOMAIN}"
     echo "Portainer                : https://portainer.${USER_DOMAIN}"
     echo "Uptime Kuma              : https://uptime.${USER_DOMAIN}"
@@ -491,10 +505,15 @@ main() {
     echo "  Portainer : set admin password on first login"
     echo "======================================================"
     echo ""
-     echo "SSH key setup (on your LOCAL machine):"
-     echo "  1. ssh-keygen -t ed25519 -C \"${GITHUB_EMAIL}\"   # if you don't have one yet"
+echo "SSH admin access (on your LOCAL machine):"
+     echo "  1. ssh-keygen -t ed25519   # if you don't have one yet"
      echo "  2. cat ~/.ssh/id_ed25519.pub                     # copy the output"
      echo "  3. Paste it into this server's ~/.ssh/authorized_keys"
+     if [[ -n "${USER_DOMAIN:-}" ]]; then
+     echo "  4. ssh $SSH_USER@ssh.${USER_DOMAIN}"
+     fi
+     echo "======================================================"
+     echo "Want a CI/CD self-hosted runner? Run: ./install-runner.sh"
      echo "======================================================"
 }
 
