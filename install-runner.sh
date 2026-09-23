@@ -53,6 +53,72 @@ prompt_runner() {
     fi
 }
 
+# Systemd unit created by svc.sh install (actions.runner.*.service).
+runner_svc_unit() {
+    local f
+    for f in /etc/systemd/system/actions.runner.*.service; do
+        [[ -e "$f" ]] || return 1
+        basename "$f" .service
+        return 0
+    done
+    return 1
+}
+
+# Build + load gh_runner SELinux module from fresh AVC denials on stdin.
+selinux_remediate() {
+    if ! command -v audit2allow &>/dev/null; then
+        info "Installing SELinux policy tools..."
+        pkg_install policycoreutils-python-utils || return 1
+    fi
+    local fresh
+    fresh=$(grep -v "clr-debug-pipe" || true)
+    if [[ -z "$fresh" ]]; then
+        warn "No fresh SELinux denials — cannot auto-remediate."
+        return 1
+    fi
+    printf '%s\n' "$fresh" | (cd "$HOME" && audit2allow -M gh_runner) || return 1
+    sudo semodule -i "$HOME/gh_runner.pp" || return 1
+    ok "Loaded SELinux module gh_runner."
+}
+
+# Start the runner service; auto-remediate SELinux denials in a bounded loop.
+start_runner_service() {
+    local svc_unit
+    svc_unit=$(runner_svc_unit || true)
+    if [[ -z "$svc_unit" ]]; then
+        err "Runner service unit not found under /etc/systemd/system."
+        return 1
+    fi
+
+    sudo ./svc.sh start || true
+    local since_epoch
+    since_epoch=$(date +%s)
+
+    local round
+    for round in 1 2 3 4 5 6; do
+        sleep 12
+        if sudo systemctl is-active --quiet "$svc_unit"; then
+            ok "Runner service is active."
+            return 0
+        fi
+        if ! command -v getenforce &>/dev/null || [[ "$(getenforce 2>/dev/null)" != "Enforcing" ]]; then
+            break
+        fi
+        warn "Service not active (round $round/6) — rebuilding SELinux policy from fresh denials..."
+        if sudo grep "type=AVC" /var/log/audit/audit.log 2>/dev/null \
+            | awk -F'[():]' -v s="$since_epoch" '$2+0>=s' \
+            | selinux_remediate; then
+            sudo systemctl restart "$svc_unit" || true
+        else
+            break
+        fi
+    done
+
+    err "Runner service '$svc_unit' is not active after remediation attempts."
+    err "Manual runbook: sudo ausearch -m avc -ts recent | audit2allow -M gh_runner && sudo semodule -i gh_runner.pp && sudo systemctl restart $svc_unit"
+    return 1
+}
+
 install_runner() {
     if [[ "$(id -u)" -eq 0 ]]; then
         err "The Actions runner refuses to run as root (config.sh limitation)."
@@ -92,7 +158,12 @@ install_runner() {
         err "Update RUNNER_VERSION in install-runner.sh (github.com/actions/runner/releases), or retry later."
         return 1
     fi
-    tar -xzf /tmp/actions-runner.tar.gz -C "$runner_dir"
+    if ! tar -xzf /tmp/actions-runner.tar.gz -C "$runner_dir"; then
+        err "Failed to extract $tarball — the download may be corrupt."
+        err "Manual cleanup: rm -rf ${runner_dir}"
+        err "Then re-run install-runner.sh."
+        return 1
+    fi
     rm -f /tmp/actions-runner.tar.gz
 
     cd "$runner_dir"
@@ -109,7 +180,9 @@ install_runner() {
         return 1
     fi
 
-    sudo ./svc.sh start || true
+    if ! start_runner_service; then
+        return 1
+    fi
     ok "Self-hosted runner registered and running as a systemd service."
     echo "install-runner.sh version: $SCRIPT_VERSION"
     echo ""
