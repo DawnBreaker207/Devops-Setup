@@ -9,79 +9,67 @@ curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/se
 ```
 
 The script will prompt for:
-- **GitHub Email** — used for SSH key generation hint
-- **Cloudflare Tunnel Name** — choose any name, default is `infra-tunnel`
-- **Domain** — if provided, ingress will be auto-generated. Leave blank to skip
-- **SSH Username** — default is current user
-- **Only SSH via Cloudflare Tunnel?** — default `n` (also exposes port 22)
-- **App deploy directory** — default `/opt/myapp` (where your docker-compose files live)
+- **Cloudflare Tunnel Name** — default `infra-tunnel` (use a different name per VM)
+- **Domain** — leave blank to skip tunnel ingress (e.g. example.com)
+- **SSH subdomain** — default `ssh` (uses `<subdomain>.yourdomain.com`; use a different one per VM sharing a domain)
+- **SSH username** — default current user
+- **Expose SSH port 22 directly?** — `y/n`, default `n` (tunnel-only; opens `22/tcp` only on `y`)
 
-Configuration is saved to `~/.deploy-env` for later sync operations.
+On failure the script rolls back all changes automatically.
 
 ## 2. Services
 
-| Service             | URL                      |
-| ------------------- | ------------------------ |
-| Portainer           | https://localhost:9443   |
-| Uptime Kuma         | http://localhost:3001    |
-| Deploy Webhook      | http://localhost:9000    |
+| Service     | URL                    |
+| ----------- | ---------------------- |
+| Portainer   | https://localhost:9443 |
+| Uptime Kuma | http://localhost:3001  |
 
-If a domain is provided, services are accessible via Cloudflare Tunnel:
-- `portainer.<YOUR_DOMAIN>`
-- `uptime.<YOUR_DOMAIN>`
-- `deploy.<YOUR_DOMAIN>`
+Portainer and Uptime Kuma are LAN/localhost only (no public ingress). With a domain, the only public ingress is SSH admin access:
+- `<SSH_SUBDOMAIN>.<YOUR_DOMAIN>` → `ssh://localhost:22` (default `ssh.<YOUR_DOMAIN>`)
 
-Watchtower auto-updates all labeled containers daily at 04:00 (fallback). Deploy Webhook provides on-demand triggers from CI/CD.
+Watchtower auto-updates labeled containers daily at 04:00.
 
-The webhook container mounts `$APP_DIR` (chosen during setup) so `deploy.sh` can access your `docker-compose.yml` and `docker-compose.prod.yml`. Place these files in the app directory after setup.
+## 3. CI/CD with GitHub Actions (self-hosted runner)
 
-## 3. CI/CD with GitHub Actions (Webhook)
-
-Deploy via HTTP POST instead of SSH — no public SSH port needed.
-
-### Setup
-
-1. Add **repository secret** `DEPLOY_WEBHOOK_TOKEN` with the token printed at setup end
-2. Add **repository variable** `DEPLOY_DOMAIN` = `deploy.<YOUR_DOMAIN>`
-
-### Workflow
-
-In your app repo's `.github/workflows/deploy.yml`:
-
-```yaml
-- name: Deploy via webhook
-  run: |
-    curl -sf -X POST "https://deploy.${{ vars.DEPLOY_DOMAIN }}/hooks/deploy" \
-      -H "X-Deploy-Token: ${{ secrets.DEPLOY_WEBHOOK_TOKEN }}" \
-      -H "Content-Type: application/json" \
-      -d "{\"image_tag\": \"${{ steps.tag.outputs.tag }}\"}"
-```
-
-The webhook runs `deploy.sh` on the server which executes `docker compose pull && up -d` with the specified tag.
-
-### Manual test
+After setup, on the server run:
 
 ```bash
-curl -X POST https://deploy.<YOUR_DOMAIN>/hooks/deploy \
-  -H "X-Deploy-Token: <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"image_tag": "v1.0.0"}'
+./install-runner.sh
+```
+
+It prompts for GitHub email, repo URL (blank = skip, prints an SSH key hint instead) and a runner registration token (repo Settings > Actions > Runners, expires in ~1h), then registers the runner as a systemd service (never as root).
+
+Then in your app repo create `.github/workflows/deploy.yml`:
+
+```yaml
+name: Deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build
+      - run: docker compose up -d --force-recreate
 ```
 
 ## 4. Remote SSH Access (Client Setup)
 
-SSH into the server from any machine via Cloudflare Tunnel ingress (`ssh.<YOUR_DOMAIN>` → `ssh://localhost:22`).
+SSH into the server from any machine via Cloudflare Tunnel ingress (`<SSH_SUBDOMAIN>.<YOUR_DOMAIN>` → `ssh://localhost:22`, default `ssh.<YOUR_DOMAIN>`).
 
 ### Step 1 — Verify DNS record
 
 ```bash
-dig ssh.<YOUR_DOMAIN>
+dig <SSH_SUBDOMAIN>.<YOUR_DOMAIN>
 ```
+(default: `dig ssh.<YOUR_DOMAIN>`)
 
 Must show a CNAME to `*.cfargotunnel.com`. If missing:
 
 ```bash
-cloudflared tunnel route dns <TUNNEL_NAME> ssh.<YOUR_DOMAIN>
+cloudflared tunnel route dns <TUNNEL_NAME> <SSH_SUBDOMAIN>.<YOUR_DOMAIN>
 ```
 
 ### Step 2 — Generate SSH key on your local machine
@@ -96,8 +84,9 @@ Copy the output and add it to the server's `~/.ssh/authorized_keys` (via VPS con
 ### Step 3 — Connect via tunnel
 
 ```bash
-ssh <SSH_USER>@ssh.<YOUR_DOMAIN>
+ssh <SSH_USER>@<SSH_SUBDOMAIN>.<YOUR_DOMAIN>
 ```
+(default: `ssh <SSH_USER>@ssh.<YOUR_DOMAIN>`)
 
 No `cloudflared` client installation needed — Cloudflare Tunnel handles the connection transparently as long as the ingress rule `ssh://localhost:22` is active.
 
@@ -120,12 +109,9 @@ sudo chcon -Rt container_file_t /path/to/bind/mount
 
 ## 6. Firewall
 
-The setup script opens necessary ports via `firewalld`:
-- `9443/tcp` — Portainer
-- `3001/tcp` — Uptime Kuma
-- `22/tcp` — only if SSH port exposure is enabled during setup
+The setup script opens `22/tcp` via `firewalld` only when SSH port exposure is enabled during setup (`y`). Nothing else is opened.
 
-All changes are persistent across reboots. Port `9000` (webhook) is not exposed — accessed only via Cloudflare Tunnel.
+All changes are persistent across reboots.
 
 ## 7. Service Management
 
@@ -136,7 +122,7 @@ docker stop <container_name>
 docker start <container_name>
 ```
 
-Container names: `portainer`, `uptime-kuma`, `watchtower`, `deploy-webhook`.
+Container names: `portainer`, `uptime-kuma`, `watchtower`.
 
 ### Restart tunnel after config change
 
@@ -147,24 +133,17 @@ sudo systemctl restart cloudflared
 ### View logs
 
 ```bash
-docker logs deploy-webhook
+docker logs portainer
+docker logs uptime-kuma
 docker logs watchtower
 sudo journalctl -u cloudflared
 ```
 
-## 8. Sync / Cleanup / Re-deploy
-
-### Sync deploy hook after script update (`--sync`)
-
-Regenerates `hooks.json` and `deploy.sh` from the latest `setup.sh`, then restarts the `deploy-webhook` container. Preserves all existing config from `~/.deploy-env` — no prompts, no tunnel restart.
-
-```bash
-curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash -s -- --sync
-```
+## 8. Cleanup / Re-deploy
 
 ### Full uninstall (`--cleanup`)
 
-Removes all containers, volumes, Docker packages, cloudflared, firewall rules, webhook files, and `~/.deploy-env`. SSH daemon is **not** removed.
+Removes all containers, volumes, Docker packages, cloudflared and firewall rules. SSH daemon is **not** removed.
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash -s -- --cleanup

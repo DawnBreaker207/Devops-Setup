@@ -112,6 +112,7 @@ trap 'rollback_all' ERR INT TERM
 # prompt_config() vars (per-site; feeds a future myserver.env):
 #   CF_TUNNEL_NAME  string  default: infra-tunnel
 #   USER_DOMAIN     string  default: "" (blank = skip ingress)
+#   SSH_SUBDOMAIN   string  default: ssh (SSH over <subdomain>.<domain>)
 #   SSH_USER        string  default: $USER
 #   EXPOSE_SSH      y|n     default: n (open firewall 22/tcp?)
 # ============================================================================
@@ -127,6 +128,15 @@ prompt_config() {
     ask "Your Domain (e.g. example.com) — leave blank to skip tunnel ingress"
     read -r USER_DOMAIN < /dev/tty
 
+    ask "SSH subdomain for tunnel access (default: ssh — uses <subdomain>.yourdomain.com)"
+    read -r SSH_SUBDOMAIN < /dev/tty
+    SSH_SUBDOMAIN="${SSH_SUBDOMAIN:-ssh}"
+    if ! [[ "$SSH_SUBDOMAIN" =~ ^[A-Za-z0-9-]+$ ]]; then
+        err "SSH subdomain must be letters, numbers or hyphens."
+        trap - ERR INT TERM
+        exit 1
+    fi
+
     ask "SSH username on this server (default: $USER)"
     read -r SSH_USER < /dev/tty
     SSH_USER="${SSH_USER:-$USER}"
@@ -138,6 +148,7 @@ prompt_config() {
     echo "----------------------------------------------"
     echo "  Tunnel Name  : $CF_TUNNEL_NAME"
     echo "  Domain       : ${USER_DOMAIN:-"(skipped)"}"
+    echo "  SSH Subdomain: $SSH_SUBDOMAIN"
     echo "  SSH User     : $SSH_USER"
     echo "  Expose SSH   : $EXPOSE_SSH"
     echo "----------------------------------------------"
@@ -350,13 +361,7 @@ configure_cloudflare_tunnel() {
                 echo "credentials-file: ${CREDS_FILE}"
                 echo ""
                 echo "ingress:"
-                echo "  - hostname: portainer.${USER_DOMAIN}"
-                echo "    service: https://localhost:9443"
-                echo "    originRequest:"
-                echo "      noTLSVerify: true"
-                echo "  - hostname: uptime.${USER_DOMAIN}"
-                echo "    service: http://localhost:3001"
-                echo "  - hostname: ssh.${USER_DOMAIN}"
+                echo "  - hostname: ${SSH_SUBDOMAIN}.${USER_DOMAIN}"
                 echo "    service: ssh://localhost:22"
                 echo "  - service: http_status:404"
             } > "$CONFIG_FILE"
@@ -379,7 +384,7 @@ EOF
             warn "Existing config missing SSH ingress — patching..."
             local ESCAPED_DOMAIN
             ESCAPED_DOMAIN=$(printf '%s' "$USER_DOMAIN" | sed 's/\./\\./g')
-            sed -i "s|  - service: http_status:404|  - hostname: ssh.${ESCAPED_DOMAIN}\n    service: ssh://localhost:22\n  - service: http_status:404|" "$CONFIG_FILE"
+            sed -i "s|  - service: http_status:404|  - hostname: ${SSH_SUBDOMAIN}.${ESCAPED_DOMAIN}\n    service: ssh://localhost:22\n  - service: http_status:404|" "$CONFIG_FILE"
             ok "SSH ingress rule patched into existing config."
         else
             ok "SSH ingress rule already present in config."
@@ -388,11 +393,11 @@ EOF
     fi
 
     if [[ -n "${USER_DOMAIN:-}" ]]; then
-        info "Registering DNS CNAME for ssh.${USER_DOMAIN}..."
-        if cloudflared tunnel route dns "$CF_TUNNEL_NAME" "ssh.${USER_DOMAIN}" 2>/dev/null; then
-            ok "DNS record created: ssh.${USER_DOMAIN}"
+        info "Registering DNS CNAME for ${SSH_SUBDOMAIN}.${USER_DOMAIN}..."
+        if cloudflared tunnel route dns "$CF_TUNNEL_NAME" "${SSH_SUBDOMAIN}.${USER_DOMAIN}" 2>/dev/null; then
+            ok "DNS record created: ${SSH_SUBDOMAIN}.${USER_DOMAIN}"
         else
-            warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME ssh.${USER_DOMAIN}"
+            warn "DNS record may already exist or failed — verify manually with: cloudflared tunnel route dns $CF_TUNNEL_NAME ${SSH_SUBDOMAIN}.${USER_DOMAIN}"
         fi
 
     fi
@@ -446,8 +451,8 @@ cleanup_all() {
 
         pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
         remove_cloudflared 2>/dev/null || true
-        firewall_deny_port 9443/tcp
-        firewall_deny_port 3001/tcp
+        firewall_deny_port 9443/tcp || true
+        firewall_deny_port 3001/tcp || true
 
         sudo systemctl daemon-reload 2>/dev/null || true
     else
@@ -496,9 +501,7 @@ main() {
     echo "Uptime Kuma              : http://localhost:3001"
     echo "Watchtower               : auto-update daily at 04:00"
     if [[ -n "${USER_DOMAIN:-}" ]]; then
-    echo "SSH Tunnel               : ssh.${USER_DOMAIN}"
-    echo "Portainer                : https://portainer.${USER_DOMAIN}"
-    echo "Uptime Kuma              : https://uptime.${USER_DOMAIN}"
+    echo "SSH Tunnel               : ${SSH_SUBDOMAIN}.${USER_DOMAIN}"
     fi
     echo "======================================================"
     echo "!!!  DEFAULT CREDENTIALS — CHANGE IMMEDIATELY  !!!"
@@ -510,7 +513,7 @@ echo "SSH admin access (on your LOCAL machine):"
      echo "  2. cat ~/.ssh/id_ed25519.pub                     # copy the output"
      echo "  3. Paste it into this server's ~/.ssh/authorized_keys"
      if [[ -n "${USER_DOMAIN:-}" ]]; then
-     echo "  4. ssh $SSH_USER@ssh.${USER_DOMAIN}"
+     echo "  4. ssh $SSH_USER@${SSH_SUBDOMAIN}.${USER_DOMAIN}"
      fi
      echo "======================================================"
      echo "Want a CI/CD self-hosted runner? Run: ./install-runner.sh"
