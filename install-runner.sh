@@ -159,6 +159,33 @@ EOFTE
     ok "Loaded SELinux module gh_runner."
 }
 
+# Major version of this distro (9, 10, ...). Always numeric, defaults to 9.
+os_major() {
+    grep -E '^VERSION_ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' | cut -d. -f1 | grep -E '^[0-9]+$' || echo 9
+}
+
+# Dotnet deps for the runner. EL9: the bundled installer works. EL10:
+# lttng-ust is gone, so install the rest directly; without libicu fall back
+# to invariant globalization via the runner's .env file.
+install_runner_deps() {
+    if [[ "$(os_major)" -ge 10 ]]; then
+        local pkgs=(openssl-libs krb5-libs zlib-ng-compat)
+        if sudo dnf list --available "libicu" 2>/dev/null | grep -q "^libicu\."; then
+            pkgs+=(libicu)
+        else
+            warn "libicu not available on EL$(os_major) — runner will use invariant globalization."
+            grep -q "^DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=" .env 2>/dev/null \
+                || echo "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1" >> .env
+        fi
+        pkg_install "${pkgs[@]}" || return 1
+    else
+        (cd "$runner_dir" && sudo ./bin/installdependencies.sh) || {
+            err "Runner dependency install failed."
+            return 1
+        }
+    fi
+}
+
 install_runner() {
     if [[ "$(id -u)" -eq 0 ]]; then
         err "The Actions runner refuses to run as root (config.sh limitation)."
@@ -207,6 +234,7 @@ install_runner() {
     rm -f /tmp/actions-runner.tar.gz
 
     cd "$runner_dir"
+    install_runner_deps || return 1
     if ! ./config.sh --url "$GITHUB_REPO_URL" --token "$RUNNER_TOKEN" --unattended --replace; then
         err "Runner registration failed. Check GITHUB_REPO_URL and RUNNER_TOKEN."
         err "Manual cleanup: rm -rf ${runner_dir}"

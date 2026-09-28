@@ -2,7 +2,7 @@
 
 ## 1. Fast Deployment
 
-Run on a clean Rocky Linux 9 server:
+Run on a clean Rocky Linux 9 or 10 server:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash
