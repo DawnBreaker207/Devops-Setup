@@ -27,8 +27,6 @@ On failure the script rolls back all changes automatically.
 Portainer and Uptime Kuma are LAN/localhost only (no public ingress). With a domain, the only public ingress is SSH admin access:
 - `<SSH_SUBDOMAIN>.<YOUR_DOMAIN>` → `ssh://localhost:22` (default `ssh.<YOUR_DOMAIN>`)
 
-Watchtower auto-updates labeled containers daily at 04:00.
-
 ## 3. CI/CD with GitHub Actions (self-hosted runner)
 
 After setup, on the server run:
@@ -122,7 +120,7 @@ docker stop <container_name>
 docker start <container_name>
 ```
 
-Container names: `portainer`, `uptime-kuma`, `watchtower`.
+Container names: `portainer`, `uptime-kuma`.
 
 ### Restart tunnel after config change
 
@@ -135,18 +133,46 @@ sudo systemctl restart cloudflared
 ```bash
 docker logs portainer
 docker logs uptime-kuma
-docker logs watchtower
 sudo journalctl -u cloudflared
 ```
+
+### Clock drift
+
+A wrong system clock breaks runner OAuth/token refresh (listener exits, service dead). Diagnose:
+
+```bash
+timedatectl status
+chronyc tracking | grep -E "Leap|System time"
+```
+
+Fix:
+
+```bash
+sudo timedatectl set-ntp true
+sudo systemctl enable --now chronyd
+sleep 3
+sudo chronyc makestep
+sudo hwclock --systohc
+```
+
+Healthy when `System time` is `~0.000 seconds off NTP time`. Containers pick up the host clock; no restarts needed.
 
 ## 8. Cleanup / Re-deploy
 
 ### Full uninstall (`--cleanup`)
 
-Removes all containers, volumes, Docker packages, cloudflared and firewall rules. SSH daemon is **not** removed.
+Removes all containers, volumes, Docker packages, cloudflared and firewall rules. Also stops the self-hosted runner service and removes `~/actions-runner` — delete the orphan runner manually afterwards: repo Settings > Actions > Runners. SSH daemon is **not** removed.
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash -s -- --cleanup
+```
+
+### Nuclear purge (`--purge`)
+
+Deletes **everything Docker**: all containers, images, volumes and build cache, plus everything `--cleanup` removes. Docker volumes may hold real data — this cannot be undone. Requires typing `YES`. SSH access is always kept.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash -s -- --purge
 ```
 
 ### Re-deploy preserving tunnel credentials (`--overwrite`)
@@ -160,3 +186,15 @@ curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/se
 ## 9. Note
 
 This is the **rocky** branch. For Ubuntu, use the `ubuntu` branch instead.
+
+## 10. Update in place (`--update`)
+
+Refreshes binaries/images to the pinned versions using saved inputs — no prompts, no re-entering anything. Tunnel cert/creds/config, `authorized_keys` and volumes are never touched; on failure it reports instead of rolling back.
+
+Every successful setup saves non-secret inputs to `~/.infra-setup.env` (chmod 600). `--update` reuses them; on a machine without the file it prompts once, saves, then proceeds.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/DawnBreaker207/Devops-Setup/rocky/setup.sh | bash -s -- --update
+```
+
+What it does: `prep_system` → upgrades `cloudflared` if the pin moved → pulls pinned Portainer/Uptime Kuma images and recreates those containers (data stays in volumes) → ensures sshd/firewall per saved `EXPOSE_SSH` → restarts cloudflared with the existing config untouched.

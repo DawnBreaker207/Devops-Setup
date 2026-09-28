@@ -9,7 +9,6 @@ readonly CLOUDFLARED_VERSION="2026.7.3"
 readonly DOCKER_COMPOSE_VERSION="2.32.1"
 readonly PORTAINER_VERSION="2.27.3"
 readonly UPTIME_KUMA_VERSION="1.23.16"
-readonly WATCHTOWER_VERSION="1.7.1"
 readonly SCRIPT_VERSION="1.0.0"
 
 info() { printf "%b[INFO]%b %s\n" "\e[34m" "\e[0m" "$1"; }
@@ -36,30 +35,22 @@ pkg_remove()    { sudo dnf remove -y "$@" 2>/dev/null || true; }
 svc_name_sshd() { echo "sshd"; }
 svc_enable()    { sudo systemctl enable --now "$1"; }
 svc_disable()   { sudo systemctl disable --now "$1" 2>/dev/null || true; }
-svc_restart()   { sudo systemctl restart "$1"; }
 
-install_cloudflared() {
-    local version="$1"
-    if command -v cloudflared &>/dev/null; then
-        ok "cloudflared already installed. Skipping download."
-        return 0
+# Remove a self-hosted runner installed by install-runner.sh (if any).
+# Cannot deregister from GitHub without a fresh token — delete the orphan
+# runner manually afterwards: repo Settings > Actions > Runners.
+remove_runner() {
+    local f
+    for f in /etc/systemd/system/actions.runner.*.service; do
+        [[ -e "$f" ]] || continue
+        svc_disable "$(basename "$f" .service)"
+        sudo rm -f "$f"
+    done
+    if [[ -d "$HOME/actions-runner" ]]; then
+        warn "Removing ~/actions-runner — delete the orphan runner manually: repo Settings > Actions > Runners."
+        rm -rf "$HOME/actions-runner"
     fi
-    local arch
-    arch=$(uname -m)
-    info "Downloading cloudflared ${version} (${arch})..."
-    if ! curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm; then
-        err "Failed to download cloudflared ${version} RPM — the pinned version may not exist."
-        err "Update CLOUDFLARED_VERSION in setup.sh to a valid release (github.com/cloudflare/cloudflared/releases)."
-        return 1
-    fi
-    sudo rpm -U /tmp/cloudflared.rpm || {
-        err "Failed to install cloudflared RPM."
-        return 1
-    }
-    rm -f /tmp/cloudflared.rpm
 }
-
-remove_cloudflared()         { sudo dnf remove -y cloudflared 2>/dev/null || true; }
 
 firewall_allow_port() {
     if command -v firewall-cmd &>/dev/null; then
@@ -160,6 +151,18 @@ prompt_config() {
         trap - ERR INT TERM
         exit 1
     fi
+
+    # Persist non-secret inputs so `--update` can run promptless.
+    # Sourced back with `set -u` active: %q-quoting keeps re-sourcing safe.
+    {
+        printf 'CF_TUNNEL_NAME=%q\n' "$CF_TUNNEL_NAME"
+        printf 'USER_DOMAIN=%q\n' "$USER_DOMAIN"
+        printf 'SSH_SUBDOMAIN=%q\n' "$SSH_SUBDOMAIN"
+        printf 'SSH_USER=%q\n' "$SSH_USER"
+        printf 'EXPOSE_SSH=%q\n' "$EXPOSE_SSH"
+    } > "$HOME/.infra-setup.env"
+    chmod 600 "$HOME/.infra-setup.env"
+    ok "Inputs saved to ~/.infra-setup.env (reused by --update, no prompts)."
 }
 
 # ============================================================================
@@ -224,7 +227,7 @@ prep_system() {
 }
 
 # ============================================================================
-# 2. launch_container
+# 2. Container Orchestration
 # ============================================================================
 launch_container() {
     local name=$1
@@ -239,24 +242,18 @@ launch_container() {
     push_rollback "dockerx rm -f '$name'"
 }
 
-# ============================================================================
-# 3. Container Orchestration
-# ============================================================================
 deploy_stack() {
     selinux_apply_context /var/run/docker.sock
 
     info "Deploying Portainer..."
-    launch_container "portainer" -p 8000:8000 -p 9443:9443 --group-add "$DOCKER_SOCKET_GID" -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data -l com.centurylinklabs.watchtower.enable=true "portainer/portainer-ce:${PORTAINER_VERSION}"
+    launch_container "portainer" -p 8000:8000 -p 9443:9443 --group-add "$DOCKER_SOCKET_GID" -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data "portainer/portainer-ce:${PORTAINER_VERSION}"
 
     info "Deploying Uptime Kuma..."
-    launch_container "uptime-kuma" -p 3001:3001 --group-add "$DOCKER_SOCKET_GID" -v uptime_kuma_data:/app/data -v /var/run/docker.sock:/var/run/docker.sock -l com.centurylinklabs.watchtower.enable=true "louislam/uptime-kuma:${UPTIME_KUMA_VERSION}"
-
-    info "Deploying Watchtower..."
-    launch_container "watchtower" --group-add "$DOCKER_SOCKET_GID" -v /var/run/docker.sock:/var/run/docker.sock "containrrr/watchtower:${WATCHTOWER_VERSION}" --schedule "0 0 4 * * *" --cleanup --label-enable
+    launch_container "uptime-kuma" -p 3001:3001 --group-add "$DOCKER_SOCKET_GID" -v uptime_kuma_data:/app/data -v /var/run/docker.sock:/var/run/docker.sock "louislam/uptime-kuma:${UPTIME_KUMA_VERSION}"
 }
 
 # ============================================================================
-# 4. SSH Server
+# 3. SSH Server
 # ============================================================================
 configure_ssh_server() {
     info "Checking SSH daemon (sshd)..."
@@ -296,8 +293,31 @@ configure_ssh_server() {
 }
 
 # ============================================================================
-# 5. Cloudflare Tunnel
+# 4. Cloudflare Tunnel
 # ============================================================================
+install_cloudflared() {
+    local version="$1"
+    if command -v cloudflared &>/dev/null; then
+        ok "cloudflared already installed. Skipping download."
+        return 0
+    fi
+    local arch
+    arch=$(uname -m)
+    info "Downloading cloudflared ${version} (${arch})..."
+    if ! curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}.rpm" -o /tmp/cloudflared.rpm; then
+        err "Failed to download cloudflared ${version} RPM — the pinned version may not exist."
+        err "Update CLOUDFLARED_VERSION in setup.sh to a valid release (github.com/cloudflare/cloudflared/releases)."
+        return 1
+    fi
+    sudo rpm -U /tmp/cloudflared.rpm || {
+        err "Failed to install cloudflared RPM."
+        return 1
+    }
+    rm -f /tmp/cloudflared.rpm
+}
+
+remove_cloudflared()         { sudo dnf remove -y cloudflared 2>/dev/null || true; }
+
 configure_cloudflare_tunnel() {
     info "Configuring Cloudflare Tunnel..."
     install_cloudflared "$CLOUDFLARED_VERSION" || {
@@ -430,13 +450,19 @@ cleanup_all() {
     warn "Cleaning up all infrastructure (mode: $mode)..."
 
     docker rm -f portainer uptime-kuma watchtower 2>/dev/null || true
+    if [[ "$mode" = "purge" ]]; then
+        warn "Purging ALL docker data (containers, images, volumes)..."
+        docker ps -aq 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+        docker system prune -af --volumes 2>/dev/null || true
+    fi
     docker network rm "$NET" 2>/dev/null || true
     docker volume rm portainer_data uptime_kuma_data 2>/dev/null || true
+    docker image prune -f 2>/dev/null || true
 
     sudo systemctl stop cloudflared 2>/dev/null || true
     sudo cloudflared service uninstall 2>/dev/null || true
 
-    if [[ "$mode" = "full" ]]; then
+    if [[ "$mode" = "full" ]] || [[ "$mode" = "purge" ]]; then
         local existing_tunnel
         existing_tunnel=$(grep '^tunnel:' "$CF_CONFIG_DIR/config.yml" 2>/dev/null | awk '{print $2}' || true)
         if [[ -n "$existing_tunnel" ]]; then
@@ -451,8 +477,12 @@ cleanup_all() {
 
         pkg_remove docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
         remove_cloudflared 2>/dev/null || true
+        remove_runner
         firewall_deny_port 9443/tcp || true
         firewall_deny_port 3001/tcp || true
+        if [[ "$mode" = "purge" ]]; then
+            sudo rm -rf /var/lib/docker 2>/dev/null || true
+        fi
 
         sudo systemctl daemon-reload 2>/dev/null || true
     else
@@ -469,9 +499,85 @@ cleanup_all() {
 }
 
 # ============================================================================
+# Update in place (--update): refresh binaries/images to pinned versions
+# using saved inputs. No prompts, no rollback (never destroys on failure),
+# never touches tunnel cert/creds/config or authorized_keys.
+# ============================================================================
+update_stack() {
+    trap - ERR INT TERM
+    local ENV_FILE="$HOME/.infra-setup.env"
+    if [[ -f "$ENV_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+        ok "Loaded saved inputs from $ENV_FILE (no prompts)."
+    else
+        warn "No saved inputs at $ENV_FILE — prompting once, then saving for next time."
+        prompt_config
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+    fi
+    : "${CF_TUNNEL_NAME:?saved CF_TUNNEL_NAME is empty}"
+    : "${SSH_SUBDOMAIN:?saved SSH_SUBDOMAIN is empty}"
+    : "${SSH_USER:?saved SSH_USER is empty}"
+    : "${EXPOSE_SSH:?saved EXPOSE_SSH is empty}"
+    : "${USER_DOMAIN:=}"
+    info "Updating: tunnel=$CF_TUNNEL_NAME domain=${USER_DOMAIN:-(none)} ssh=$SSH_SUBDOMAIN user=$SSH_USER expose=$EXPOSE_SSH"
+
+    prep_system
+
+    local installed
+    installed=$(cloudflared --version 2>/dev/null | awk '{print $3}' || true)
+    if [[ "$installed" != "$CLOUDFLARED_VERSION" ]]; then
+        info "cloudflared ${installed:-missing} -> $CLOUDFLARED_VERSION..."
+        if curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-$(uname -m).rpm" -o /tmp/cloudflared.rpm; then
+            sudo rpm -U /tmp/cloudflared.rpm && ok "cloudflared updated." || err "cloudflared update failed — keeping ${installed:-nothing}."
+            rm -f /tmp/cloudflared.rpm
+        else
+            err "Download failed — keeping ${installed:-nothing}."
+        fi
+    else
+        ok "cloudflared already at pinned version."
+    fi
+
+    info "Refreshing infra images to pinned versions (volumes persist)..."
+    dockerx pull "portainer/portainer-ce:${PORTAINER_VERSION}"
+    dockerx pull "louislam/uptime-kuma:${UPTIME_KUMA_VERSION}"
+    dockerx rm -f portainer uptime-kuma 2>/dev/null || true
+    deploy_stack
+
+    configure_ssh_server
+
+    if sudo test -f /etc/systemd/system/cloudflared.service; then
+        info "Reloading cloudflared with existing config (untouched)..."
+        sudo systemctl restart cloudflared
+    else
+        warn "cloudflared service not installed — run full setup once to create the tunnel."
+    fi
+
+    trap - ERR INT TERM
+    ok "Update complete (setup.sh v$SCRIPT_VERSION). Tunnel cert/creds/config untouched."
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
+    if [[ "${1:-}" = "--purge" ]]; then
+        warn "PURGE will permanently delete ALL docker containers, images, volumes and build cache on this machine!"
+        warn "Docker volumes may hold real data (databases, uploads). This cannot be undone."
+        ask "Type YES in capitals to confirm"
+        read -r CONFIRM_PURGE < /dev/tty
+        CONFIRM_PURGE="${CONFIRM_PURGE:-n}"
+        if [[ "$CONFIRM_PURGE" != "YES" ]]; then
+            echo "Aborted."
+            trap - ERR INT TERM
+            exit 1
+        fi
+        cleanup_all purge
+        trap - ERR INT TERM
+        exit 0
+    fi
+
     if [[ "${1:-}" = "--cleanup" ]]; then
         cleanup_all full
         trap - ERR INT TERM
@@ -482,6 +588,11 @@ main() {
         cleanup_all overwrite
         echo ""
         info "Proceeding with fresh setup..."
+    fi
+
+    if [[ "${1:-}" = "--update" ]]; then
+        update_stack
+        exit 0
     fi
 
     prompt_config
@@ -499,7 +610,6 @@ main() {
     echo "Tunnel Status            : sudo systemctl status cloudflared"
     echo "Portainer                : https://localhost:9443"
     echo "Uptime Kuma              : http://localhost:3001"
-    echo "Watchtower               : auto-update daily at 04:00"
     if [[ -n "${USER_DOMAIN:-}" ]]; then
     echo "SSH Tunnel               : ${SSH_SUBDOMAIN}.${USER_DOMAIN}"
     fi

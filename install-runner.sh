@@ -119,6 +119,46 @@ start_runner_service() {
     return 1
 }
 
+# Preload known SELinux allows for the runner (learned live: exec/read/write
+# under ~/actions-runner, node map/execmem, tcp 443). Best effort — the start
+# loop below still auto-remediates anything new.
+selinux_seed() {
+    if ! command -v getenforce &>/dev/null || [[ "$(getenforce 2>/dev/null)" != "Enforcing" ]]; then
+        return 0
+    fi
+    if ! command -v checkmodule &>/dev/null || ! command -v semodule_package &>/dev/null || ! command -v semodule &>/dev/null; then
+        info "Installing SELinux policy tools..."
+        pkg_install policycoreutils-python-utils checkpolicy || return 1
+    fi
+    cat > /tmp/gh_runner.te <<'EOFTE'
+module gh_runner 1.0;
+
+require {
+	type init_t;
+	type user_home_t;
+	type http_port_t;
+	type container_runtime_t;
+	type unconfined_service_t;
+	class file { append create execute execute_no_trans ioctl lock map open read setattr write };
+	class dir rmdir;
+	class process { execmem getsession };
+	class tcp_socket name_connect;
+}
+
+allow init_t container_runtime_t:file write;
+allow init_t http_port_t:tcp_socket name_connect;
+allow init_t self:process { execmem getsession };
+allow init_t unconfined_service_t:file write;
+allow init_t user_home_t:dir rmdir;
+allow init_t user_home_t:file { append create execute execute_no_trans ioctl lock map open read setattr write };
+EOFTE
+    checkmodule -M -m -o /tmp/gh_runner.mod /tmp/gh_runner.te || return 1
+    semodule_package -o /tmp/gh_runner.pp -m /tmp/gh_runner.mod || return 1
+    sudo semodule -i /tmp/gh_runner.pp || return 1
+    command rm -f /tmp/gh_runner.te /tmp/gh_runner.mod /tmp/gh_runner.pp
+    ok "Loaded SELinux module gh_runner."
+}
+
 install_runner() {
     if [[ "$(id -u)" -eq 0 ]]; then
         err "The Actions runner refuses to run as root (config.sh limitation)."
@@ -179,6 +219,8 @@ install_runner() {
         err "Manual cleanup: (cd ${runner_dir} && ./config.sh remove --token \"${RUNNER_TOKEN}\")"
         return 1
     fi
+
+    selinux_seed || warn "SELinux seed failed — continuing, the start loop will retry."
 
     if ! start_runner_service; then
         return 1
